@@ -1,0 +1,256 @@
+id: IR-007
+name: Insider Threat Investigation
+version: 1.0.0
+author: CostNimbus
+category: insider-threat
+severity: [medium, high]
+mitre_attack:
+  - T1078       # Valid Accounts
+  - T1213       # Data from Information Repositories
+  - T1052.001   # Exfiltration over USB
+  - T1567.002   # Exfiltration to Cloud Storage
+  - T1048.003   # Exfiltration over alternative protocol
+  - T1136       # Create Account (persistence for future access)
+  - T1531       # Account Access Removal (covering tracks)
+trigger:
+  - ueba_anomaly_alert
+  - hr_offboarding_trigger
+  - dlp_policy_violation_insider
+  - siem_after_hours_access
+  - peer_manager_report
+  - security_tip_line_report
+tags:
+  - insider-threat
+  - ueba
+  - data-theft
+  - employee-monitoring
+  - hr-coordination
+  - legal-hold
+tools_required:
+  - ueba
+  - siem
+  - dlp_platform
+  - edr
+  - identity_provider
+estimated_time: 90m
+
+integrations:
+  - platform: microsoft_sentinel_ueba
+    optional: false
+    notes: "User and Entity Behavior Analytics — entity risk scoring"
+  - platform: varonis
+    optional: true
+    notes: "File system activity monitoring and data access anomaly detection"
+  - platform: splunk_ueba
+    optional: true
+    notes: "Alternative UEBA — behavior baselining and anomaly detection"
+  - platform: microsoft_purview
+    optional: false
+    notes: "DLP evidence collection and legal hold management"
+  - platform: servicenow
+    optional: true
+    notes: "HR case management integration"
+
+steps:
+  - id: step-1
+    name: Receive and evaluate the initial indicator
+    type: investigation
+    tool: ueba
+    description: >
+      Assess the reliability and context of the initial indicator. UEBA alerts need baseline
+      context — what is this user's normal behavior score? HR-triggered (resignation, PIP,
+      termination notice) investigations have higher prior probability. Anonymous tips need
+      corroboration. Determine if this is a disgruntled employee, negligent insider, or
+      compromised account scenario. Engage HR to confirm employment status before proceeding.
+    automation_hint: >
+      Microsoft Sentinel UEBA: GET https://management.azure.com/subscriptions/{sub}/resourceGroups/{rg}/
+      providers/Microsoft.SecurityInsights/entityQueries/{id}?api-version=2022-12-01-preview
+      Splunk UBA: GET https://<splunk_uba>/rest/api/insight/user/<username>
+    outputs:
+      - investigation_type
+      - user_risk_score
+      - employment_status
+      - initial_indicator_source
+
+  - id: step-2
+    name: Establish covert investigation — do NOT alert subject
+    type: investigation
+    description: >
+      Insider threat investigations must remain covert until HR and Legal authorize disclosure.
+      Use need-to-know compartmentalization. Do NOT lock the account, revoke access, or confront
+      the employee until the investigation is complete and HR/Legal approve action. Do NOT discuss
+      in email — use phone or encrypted messaging. Assign a case number. Brief only the
+      investigation core team (CISO, SOC lead, Legal, HR).
+    outputs:
+      - investigation_code_name
+      - core_team_briefed
+      - legal_hold_initiated
+
+  - id: step-3
+    name: Build complete user activity timeline
+    type: investigation
+    tool: siem
+    description: >
+      Construct a comprehensive timeline of the subject's digital activity over the past 90 days.
+      Cover: data access patterns (which files, shares, databases), authentication events
+      (times, locations, devices), email activity (external recipients, large attachments),
+      web browsing (cloud storage, job boards, competitor sites), and USB/peripheral activity.
+      Compare against peer group baseline.
+    automation_hint: >
+      Splunk SPL: index=* user="<subject>" earliest=-90d
+      | stats count by sourcetype, _time span=1d | timechart span=1d count by sourcetype
+      Microsoft Purview Audit: Search-UnifiedAuditLog -StartDate (Get-Date).AddDays(-90)
+      -EndDate (Get-Date) -UserIds "<user_upn>" -ResultSize 5000 | Export-Csv activity_log.csv
+    outputs:
+      - activity_timeline
+      - anomalous_patterns
+      - peer_group_deviation
+
+  - id: step-4
+    name: Analyze file access patterns and sensitive data access
+    type: investigation
+    tool: ueba
+    description: >
+      Identify unusual data access: accessing files outside normal job function, bulk file
+      downloads or copies, accessing files of departing colleagues, accessing HR/executive
+      data, or accessing data immediately before a resignation/last day. Use Varonis or UEBA
+      to visualize the file access graph and identify abnormal patterns.
+    automation_hint: >
+      Varonis DatAdvantage: filter events by user, last 90 days, sensitivity=high
+      GET https://<varonis_server>/api/v1/users/{userId}/events?type=file_access&days=90
+      Splunk SPL: index=file_activity user="<subject>" object_type=file classification=sensitive
+      | stats count by path, action, _time | sort -count
+    outputs:
+      - sensitive_files_accessed
+      - access_volume_trend
+      - unusual_access_events
+
+  - id: step-5
+    name: Review email activity for external data sharing
+    type: investigation
+    tool: siem
+    description: >
+      Analyze the subject's email activity for indicators of data exfiltration via email:
+      large attachments sent to personal/external addresses, BCC to personal accounts,
+      forwarding rules to external domains, emails to competitors or recruiters, and
+      emails with sensitive file types (xlsx, csv, pdf, docx) sent externally.
+    automation_hint: >
+      Microsoft Purview: Search-MailboxAuditLog -Identity "<user>" -LogonTypes Owner
+      -Operations SendAs,Send -StartDate (Get-Date).AddDays(-90) | Where-Object {$_.ExternalAccess}
+      Microsoft Graph: GET https://graph.microsoft.com/v1.0/users/{userId}/mailFolders/sentItems/messages
+      ?$filter=toRecipients/any(r:not(endsWith(r/emailAddress/address,'@companydomain.com')))
+      &$select=subject,toRecipients,hasAttachments,sentDateTime
+    outputs:
+      - external_emails_sent
+      - attachment_sizes
+      - external_recipients
+      - forwarding_rules
+
+  - id: step-6
+    name: Check for cloud storage and device upload activity
+    type: investigation
+    tool: casb
+    description: >
+      Review CASB and proxy logs for uploads to personal cloud storage (Dropbox, Google Drive,
+      iCloud, Box personal), file transfer services (WeTransfer, SendSpace), and USB/external
+      device usage. Quantify data volume. Check if corporate DLP prevented transfers or only
+      logged them.
+    automation_hint: >
+      Netskope: GET https://<tenant>.goskope.com/api/v1/events?type=application&query=user+eq+<user>+AND+type+eq+upload
+      Splunk (proxy): index=proxy user="<subject>" url_category=cloud_storage http_method=POST
+      | stats sum(bytes_out) as total_bytes by url_domain | sort -total_bytes
+      CrowdStrike USB: GET https://api.crowdstrike.com/falcon-complete-dashboard/queries/detections/v1
+    outputs:
+      - cloud_upload_events
+      - usb_activity
+      - total_data_transferred
+
+  - id: step-7
+    name: Review authentication anomalies and off-hours access
+    type: investigation
+    tool: identity_provider
+    description: >
+      Review authentication patterns for anomalies: after-hours system access (particularly
+      evenings/weekends during notice period), access to systems outside normal job scope,
+      new device registrations, geolocation anomalies, and excessive failed logins (password
+      searching). Check VPN logs for connections from home network during off-hours.
+    automation_hint: >
+      Azure AD: SigninLogs | where UserPrincipalName == "<user>"
+      | where TimeGenerated > ago(90d)
+      | extend Hour = hourofday(TimeGenerated)
+      | where Hour < 7 or Hour > 19 or dayofweek(TimeGenerated) in (0, 6)
+      | project TimeGenerated, IPAddress, Location, DeviceDetail, AppDisplayName
+    outputs:
+      - after_hours_events
+      - geolocation_anomalies
+      - system_access_scope
+
+  - id: step-8
+    name: Check for account persistence or backdoor creation
+    type: investigation
+    tool: identity_provider
+    description: >
+      Determine if the subject created any backdoor access mechanisms: new service accounts,
+      OAuth app grants with broad permissions, new email forwarding rules, shared credentials
+      with external parties, or AWS/cloud IAM users. Also check if the subject attempted to
+      access colleagues' accounts or escalate their own privileges.
+    automation_hint: >
+      Azure AD: AuditLogs | where InitiatedBy.user.userPrincipalName == "<user>"
+      | where OperationName in ("Add user","Add member to role","Add service principal")
+      Microsoft 365: Get-InboxRule -Mailbox <user> | Where-Object {$_.ForwardTo -ne $null}
+      AWS: aws cloudtrail lookup-events --lookup-attributes AttributeKey=Username,AttributeValue=<user>
+      --query 'Events[?EventName==`CreateUser`]'
+    outputs:
+      - backdoor_mechanisms
+      - privilege_escalation_attempts
+      - forwarding_rules_created
+
+  - id: step-9
+    name: Compile investigation package for HR and Legal
+    type: investigation
+    description: >
+      Compile a comprehensive, legally sound evidence package: chronological timeline of all
+      suspicious activity with log evidence, estimated data exfiltrated (volume, classification),
+      policy violations identified, and screenshots of key evidence. Ensure all evidence is
+      authenticated (hash logs, timestamps from authoritative sources). Present findings to
+      Legal for review before any employment action.
+    outputs:
+      - investigation_report
+      - evidence_package
+      - policy_violations_cited
+      - legal_review_complete
+
+  - id: step-10
+    name: Execute employment action with HR and IT coordination
+    type: action
+    description: >
+      Upon HR/Legal sign-off, execute coordinated employment action: terminate access
+      simultaneously across all systems at the moment HR delivers the notification. Sequence:
+      (1) HR meeting begins, (2) IT immediately terminates all access (AD, email, VPN, badge),
+      (3) MDM wipe corporate data from personal devices, (4) Collect any corporate devices.
+      Do not allow access to any systems after notification begins.
+    automation_hint: >
+      AD account disable: Disable-ADAccount -Identity <username>
+      Revoke all sessions: POST https://graph.microsoft.com/v1.0/users/{userId}/revokeSignInSessions
+      Intune: wipe corporate data via MAM selective wipe
+      Badge system: deactivate access card
+    outputs:
+      - access_terminated
+      - termination_timestamp
+      - devices_collected
+
+post_incident:
+  - Preserve all evidence for potential legal proceedings — maintain legal hold indefinitely
+  - Conduct access review for the departed employee's system access — verify all access is revoked
+  - Review peer group access — did others have similar unauthorized data access?
+  - Implement automatic access review triggers for employees on PIPs or with resignation notice
+  - Strengthen offboarding checklist — verify access revocation within 1 hour of termination
+  - Brief CISO and legal on investigation outcomes, data exposure scope, and legal options
+  - Notify affected data subjects if regulatory breach notification is required
+  - Review and update insider threat detection rules based on observed behavior patterns
+  - Conduct lessons-learned with HR and Legal to improve investigation process
+
+metrics:
+  avg_resolution_time: 2160m
+  false_positive_rate: 40%
+  escalation_rate: 70%

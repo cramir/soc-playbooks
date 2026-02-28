@@ -1,0 +1,190 @@
+# SOC Playbook Schema v1.0
+# JSON Schema definition for incident response playbook format
+# Used by validate.js and GitHub Actions CI
+
+$schema: "http://json-schema.org/draft-07/schema#"
+title: "SOC Playbook"
+description: "Schema for CostNimbus SOC Playbook Automation Library entries"
+type: object
+
+required:
+  - id
+  - name
+  - version
+  - author
+  - category
+  - severity
+  - mitre_attack
+  - trigger
+  - tags
+  - tools_required
+  - estimated_time
+  - steps
+  - post_incident
+  - metrics
+
+properties:
+  id:
+    type: string
+    pattern: "^IR-[0-9]{3}$"
+    description: "Unique playbook identifier in format IR-XXX"
+    examples: ["IR-001", "IR-023"]
+
+  name:
+    type: string
+    minLength: 5
+    maxLength: 100
+    description: "Human-readable playbook name"
+
+  version:
+    type: string
+    pattern: "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    description: "Semantic version string"
+    examples: ["1.0.0", "1.2.3"]
+
+  author:
+    type: string
+    minLength: 2
+    description: "Playbook author name or GitHub handle"
+
+  category:
+    type: string
+    enum:
+      - email-security
+      - endpoint
+      - cloud
+      - identity
+      - network
+      - data-loss
+      - insider-threat
+      - ransomware
+      - supply-chain
+      - compliance
+    description: "Primary incident category"
+
+  severity:
+    type: array
+    items:
+      type: string
+      enum: [low, medium, high, critical]
+    minItems: 1
+    uniqueItems: true
+    description: "Severity levels this playbook applies to"
+
+  mitre_attack:
+    type: array
+    items:
+      type: string
+      pattern: "^T[0-9]{4}(\\.[0-9]{3})?$"
+    minItems: 1
+    description: "MITRE ATT&CK technique IDs (e.g. T1566.001)"
+
+  trigger:
+    type: array
+    items:
+      type: string
+    minItems: 1
+    description: "Events or alerts that trigger this playbook"
+
+  tags:
+    type: array
+    items:
+      type: string
+    minItems: 1
+    description: "Searchable keywords"
+
+  tools_required:
+    type: array
+    items:
+      type: string
+    minItems: 1
+    description: "Tools needed to execute this playbook"
+
+  estimated_time:
+    type: string
+    pattern: "^[0-9]+(m|h|d)$"
+    description: "Estimated completion time (e.g. 30m, 2h, 1d)"
+
+  integrations:
+    type: array
+    items:
+      type: object
+      required: [platform, optional]
+      properties:
+        platform:
+          type: string
+          description: "Integration platform name"
+        optional:
+          type: boolean
+          description: "Whether this integration is optional"
+        notes:
+          type: string
+          description: "Additional notes about the integration"
+    description: "Specific platform integrations with optional flag"
+
+  steps:
+    type: array
+    minItems: 5
+    items:
+      type: object
+      required: [id, name, type, description]
+      properties:
+        id:
+          type: string
+          pattern: "^step-[0-9]+$"
+          description: "Unique step identifier within the playbook"
+        name:
+          type: string
+          minLength: 3
+          description: "Short step name"
+        type:
+          type: string
+          enum: [action, investigation, decision, escalation, notification]
+          description: "Step type determines how SOAR platforms handle it"
+        tool:
+          type: string
+          description: "Primary tool used in this step"
+        description:
+          type: string
+          minLength: 10
+          description: "Detailed description of what to do in this step"
+        automation_hint:
+          type: string
+          description: "API call, CLI command, or SOAR action hint for automation"
+        outputs:
+          type: array
+          items:
+            type: string
+          description: "Variables or data produced by this step"
+        condition:
+          type: string
+          description: "Condition that determines if step executes (for decision steps)"
+        severity_override:
+          type: string
+          enum: [low, medium, high, critical]
+          description: "Override severity for escalation steps"
+    description: "Ordered list of response steps"
+
+  post_incident:
+    type: array
+    items:
+      type: string
+    minItems: 2
+    description: "Actions to take after incident is contained"
+
+  metrics:
+    type: object
+    required: [avg_resolution_time, false_positive_rate]
+    properties:
+      avg_resolution_time:
+        type: string
+        description: "Average time to resolve incidents using this playbook"
+      false_positive_rate:
+        type: string
+        description: "Estimated false positive rate for this playbook trigger"
+      escalation_rate:
+        type: string
+        description: "Percentage of incidents that require escalation"
+    description: "Effectiveness metrics for this playbook"
+
+additionalProperties: false

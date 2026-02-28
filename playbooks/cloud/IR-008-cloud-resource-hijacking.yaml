@@ -1,0 +1,249 @@
+id: IR-008
+name: Cloud Resource Hijacking (Cryptomining and Unauthorized Compute)
+version: 1.0.0
+author: CostNimbus
+category: cloud
+severity: [high, critical]
+mitre_attack:
+  - T1496       # Resource Hijacking (Cryptomining)
+  - T1578.002   # Create Cloud Instance
+  - T1578.003   # Delete Cloud Instance (covering tracks)
+  - T1190       # Exploit Public-Facing Application (initial access)
+  - T1552.005   # Cloud Instance Metadata API
+  - T1098.001   # Additional Cloud Credentials
+  - T1526       # Cloud Service Discovery
+trigger:
+  - cloud_cost_anomaly_alert
+  - aws_guardduty_cryptomining_finding
+  - compute_usage_spike
+  - billing_threshold_breach
+  - siem_unusual_instance_creation
+tags:
+  - cloud
+  - cryptomining
+  - resource-hijacking
+  - aws
+  - cost-anomaly
+  - iam-abuse
+  - unauthorized-compute
+tools_required:
+  - aws_cloudtrail
+  - aws_guardduty
+  - aws_cost_explorer
+  - aws_iam
+  - siem
+estimated_time: 35m
+
+integrations:
+  - platform: aws_guardduty
+    optional: false
+    notes: "CryptoCurrency:EC2/BitcoinTool.B, UnauthorizedAccess:EC2/TorClient findings"
+  - platform: aws_cost_explorer
+    optional: false
+    notes: "Cost anomaly detection and usage breakdown by service/region"
+  - platform: aws_cloudtrail
+    optional: false
+    notes: "Full API audit trail for instance creation and credential usage"
+  - platform: datadog
+    optional: true
+    notes: "Cloud cost monitoring and compute anomaly detection"
+  - platform: lacework
+    optional: true
+    notes: "Cloud security posture and anomaly detection alternative"
+
+steps:
+  - id: step-1
+    name: Assess the scope of unauthorized resource usage
+    type: investigation
+    tool: aws_cost_explorer
+    description: >
+      Quantify the financial and resource impact: identify which AWS services are showing
+      anomalous costs (EC2, GPU instances, Lambda, ECS), which regions, and which accounts.
+      Cryptomining typically uses compute-intensive instance types (c5.9xlarge, p3.16xlarge,
+      g4dn instances). Check cost anomaly vs. normal baseline. Calculate hourly burn rate
+      to quantify urgency.
+    automation_hint: >
+      AWS CLI: aws ce get-cost-and-usage --time-period Start=<start>,End=<end>
+      --granularity DAILY --metrics BlendedCost --group-by Type=DIMENSION,Key=SERVICE
+      AWS Cost Anomaly: aws ce get-anomalies --date-interval StartDate=<date>,EndDate=<date>
+      Boto3: ce.get_cost_forecast(TimePeriod=..., Metric='BLENDED_COST', Granularity='MONTHLY')
+    outputs:
+      - cost_impact_usd
+      - affected_services
+      - affected_regions
+      - hourly_burn_rate
+
+  - id: step-2
+    name: Identify unauthorized EC2 instances and resources
+    type: investigation
+    tool: aws_cloudtrail
+    description: >
+      Enumerate all running instances, Lambda functions, and ECS tasks that may be unauthorized.
+      Filter by: recent creation time, unusual instance types (GPU/compute-optimized for mining),
+      regions you don't normally operate in, instances with no organizational tags, and instances
+      with unusual user data scripts. Cross-reference against change management records.
+    automation_hint: >
+      aws ec2 describe-instances --query 'Reservations[].Instances[].[InstanceId,InstanceType,
+      LaunchTime,Tags,State.Name,Placement.AvailabilityZone]' --output table
+      Find untagged instances: aws ec2 describe-instances --filters "Name=tag-key,Values=Name" --query
+      'Reservations[?!Instances[?Tags]].[Instances[0].InstanceId]'
+      Find GPU instances: aws ec2 describe-instances --filters "Name=instance-type,Values=p*,g4*,p3*"
+    outputs:
+      - unauthorized_instances
+      - instance_types
+      - regions_affected
+      - instance_creation_timestamps
+
+  - id: step-3
+    name: Identify the compromised IAM credential used
+    type: investigation
+    tool: aws_cloudtrail
+    description: >
+      Pull CloudTrail events for RunInstances, CreateFunction, and CreateCluster API calls
+      in the attack timeframe. Identify the IAM principal (access key, role) used. Determine
+      if this is a leaked access key (GitHub, code leak), SSRF via metadata endpoint, or
+      compromised developer workstation. Check the source IP for these API calls.
+    automation_hint: >
+      aws cloudtrail lookup-events --lookup-attributes AttributeKey=EventName,AttributeValue=RunInstances
+      --start-time <start_iso> | jq '.Events[] | {time: .EventTime, user: .Username, ip: .CloudTrailEvent | fromjson | .sourceIPAddress}'
+      Athena: SELECT eventTime, userIdentity.accessKeyId, sourceIPAddress, requestParameters
+      FROM cloudtrail_logs WHERE eventName = 'RunInstances' AND eventTime > '<start_time>'
+    outputs:
+      - compromised_principal
+      - access_key_id
+      - source_ips
+      - api_call_pattern
+
+  - id: step-4
+    name: Terminate all unauthorized compute resources
+    type: action
+    tool: aws_iam
+    description: >
+      Immediately terminate all unauthorized EC2 instances, Lambda functions, and ECS tasks.
+      Work through each unauthorized region. For Lambda: delete the functions. For ECS: stop
+      all tasks and delete the clusters. For RDS: check for unauthorized database instances.
+      Capture instance IDs and terminate — do not stop (cryptominers restart stopped instances).
+    automation_hint: >
+      Terminate all instances in a region: aws ec2 describe-instances --region <region>
+      --query 'Reservations[].Instances[?State.Name!=`terminated`].InstanceId' --output text
+      | xargs aws ec2 terminate-instances --instance-ids
+      Lambda: aws lambda list-functions --region <region> | jq '.Functions[].FunctionName' | xargs -I {} aws lambda delete-function --function-name {}
+      ECS: aws ecs list-clusters | jq '.clusterArns[]' | xargs -I {} aws ecs delete-cluster --cluster {}
+    outputs:
+      - instances_terminated
+      - resources_deleted
+      - termination_confirmed
+
+  - id: step-5
+    name: Disable compromised credentials immediately
+    type: action
+    tool: aws_iam
+    description: >
+      Disable the compromised access key or role. Apply an emergency deny-all inline policy
+      to the compromised IAM user/role to prevent any further API calls while investigation
+      continues. Do not delete the key yet — preserve for investigation and insurance purposes.
+    automation_hint: >
+      aws iam update-access-key --access-key-id <key_id> --status Inactive --user-name <user>
+      Emergency deny: aws iam put-user-policy --user-name <user> --policy-name EmergencyStop
+      --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"*","Resource":"*"}]}'
+      Revoke role: aws iam put-role-policy --role-name <role> --policy-name EmergencyDeny
+      --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"*","Resource":"*"}]}'
+    outputs:
+      - credentials_disabled
+      - deny_policy_applied
+
+  - id: step-6
+    name: Check for attacker persistence mechanisms
+    type: investigation
+    tool: aws_cloudtrail
+    description: >
+      Attackers often create persistence via: new IAM users/access keys, Lambda functions with
+      scheduled triggers, EC2 instances with cron jobs, AWS Systems Manager automations, or
+      modified trust policies on roles. Review all CloudTrail create events for the attack
+      timeframe across all regions. Check for CloudFormation stacks left as persistence.
+    automation_hint: >
+      aws cloudtrail lookup-events --lookup-attributes AttributeKey=AccessKeyId,AttributeValue=<key_id>
+      --query 'Events[?EventName==`CreateUser` || EventName==`CreateAccessKey` || EventName==`CreateFunction`]'
+      Check new IAM users: aws iam list-users --query 'Users[?CreateDate > `<attack_start>`]'
+      Check scheduled events: aws events list-rules --query 'Rules[?State==`ENABLED`]'
+    outputs:
+      - persistence_mechanisms
+      - new_iam_principals
+      - scheduled_triggers
+
+  - id: step-7
+    name: Investigate initial access vector
+    type: investigation
+    description: >
+      Determine how the attacker obtained the credentials. Common sources for cloud hijacking:
+      (1) Hardcoded credentials in public GitHub repo, (2) SSRF vulnerability exploiting EC2
+      metadata service (IMDSv1), (3) Compromised developer machine, (4) CI/CD pipeline secrets
+      exposure, (5) Supply chain compromise of build tools. Knowing the vector determines
+      remediation scope.
+    automation_hint: >
+      GitHub credential scan: trufflehog git https://github.com/<org>/<repo>
+      IMDSv2 enforcement: aws ec2 modify-instance-metadata-options --instance-id <id>
+      --http-tokens required --http-endpoint enabled
+      Check CI/CD: review GitLab/GitHub Actions secrets and pipeline logs
+      GitGuardian: GET https://api.gitguardian.com/v1/incidents?detector=aws_iam_key
+    outputs:
+      - initial_access_vector
+      - exposure_source
+      - affected_codebase
+
+  - id: step-8
+    name: Enforce IMDSv2 and least-privilege IAM across all instances
+    type: action
+    tool: aws_iam
+    description: >
+      Remediate the systemic vulnerability that enabled credential theft. Enforce IMDSv2 on
+      all existing EC2 instances (prevents SSRF-based credential theft). Review IAM permissions
+      for all service roles — remove EC2 permissions from roles that don't need to spawn
+      instances. Implement SCP to restrict EC2 instance types in all accounts.
+    automation_hint: >
+      Enforce IMDSv2 on all instances (loop all regions):
+      for region in $(aws ec2 describe-regions --query 'Regions[].RegionName' --output text); do
+        aws ec2 describe-instances --region $region --query 'Reservations[].Instances[].InstanceId'
+        --output text | xargs -I {} aws ec2 modify-instance-metadata-options --instance-id {}
+        --http-tokens required --region $region; done
+      SCP to restrict GPU instances: use AWS Organizations SCPs
+    outputs:
+      - imdsv2_enforced_count
+      - iam_permissions_reviewed
+      - scp_applied
+
+  - id: step-9
+    name: Enable AWS cost controls and anomaly alerts
+    type: action
+    tool: aws_cost_explorer
+    description: >
+      Implement preventive controls: set up AWS Budgets with alerting, enable Cost Anomaly
+      Detection for all services, create CloudWatch billing alarms, set up EC2 Service Quotas
+      limits for GPU instance types, and enable GuardDuty in all regions with automated
+      remediation. Request a cost credit from AWS for fraudulent charges.
+    automation_hint: >
+      aws budgets create-budget --account-id <account_id> --budget file://budget.json
+      --notifications-with-subscribers file://notifications.json
+      aws ce create-anomaly-monitor --anomaly-monitor MonitorType=DIMENSIONAL,MonitorDimension=SERVICE
+      aws ce create-anomaly-subscription --anomaly-subscription Threshold=10,MonitorArnList=[<arn>],
+      Subscribers=[{Address:<email>,Type=EMAIL}],Frequency=DAILY,SubscriptionName=DailyCostAlert
+    outputs:
+      - budget_alerts_created
+      - anomaly_detection_enabled
+      - guardrails_applied
+
+post_incident:
+  - Request AWS cost credit for fraudulent charges via AWS Support (credit success rate is high for demonstrated attacks)
+  - Conduct comprehensive IAM access review — remove all unnecessary permissions
+  - Implement Service Control Policies to prevent large compute launches without approval
+  - Enable GuardDuty with threat intelligence IP feeds in all AWS regions and accounts
+  - Rotate all access keys in the affected AWS account as a precaution
+  - Implement automatic remediation via GuardDuty + Lambda for CryptoCurrency findings
+  - Remove hardcoded credentials from all code repositories; implement secrets rotation
+  - Enforce IMDSv2 on all EC2 instances via SCP and startup policy
+  - File incident report with cost impact and remediation timeline
+
+metrics:
+  avg_resolution_time: 60m
+  false_positive_rate: 5%
+  escalation_rate: 30%

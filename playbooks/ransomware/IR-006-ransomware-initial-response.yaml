@@ -1,0 +1,258 @@
+id: IR-006
+name: Ransomware Initial Response and Containment
+version: 1.0.0
+author: CostNimbus
+category: ransomware
+severity: [critical]
+mitre_attack:
+  - T1486       # Data Encrypted for Impact
+  - T1490       # Inhibit System Recovery
+  - T1489       # Service Stop
+  - T1485       # Data Destruction
+  - T1070.001   # Clear Windows Event Logs
+  - T1562.001   # Disable or Modify Tools (Impair Defenses)
+  - T1135       # Network Share Discovery
+  - T1021.002   # SMB/Windows Admin Shares (Lateral Movement)
+  - T1078       # Valid Accounts (used for initial access or lateral movement)
+trigger:
+  - edr_ransomware_detection
+  - honeypot_file_modified
+  - mass_file_rename_alert
+  - shadow_copy_deletion_alert
+  - siem_ransomware_ioc_match
+  - user_reported_ransom_note
+tags:
+  - ransomware
+  - critical-incident
+  - containment
+  - encryption
+  - business-continuity
+  - backup-recovery
+tools_required:
+  - edr
+  - siem
+  - network_firewall
+  - backup_system
+  - incident_response_platform
+estimated_time: 15m
+
+integrations:
+  - platform: crowdstrike_falcon
+    optional: false
+    notes: "Ransomware detection, host isolation, and lateral movement visibility"
+  - platform: palo_alto_cortex_xdr
+    optional: true
+    notes: "Alternative XDR with ransomware-specific behavioral detection"
+  - platform: veeam
+    optional: false
+    notes: "Backup and recovery — critical for restoration decision"
+  - platform: splunk
+    optional: false
+    notes: "Enterprise-wide log correlation during active incident"
+  - platform: servicenow
+    optional: true
+    notes: "Major incident management and executive communication"
+
+steps:
+  - id: step-1
+    name: IMMEDIATE — Declare critical incident and activate IR team
+    type: escalation
+    description: >
+      This is a P0 critical incident. Immediately wake up the full incident response team.
+      Notify CISO, CTO, and legal counsel NOW — do not wait for full analysis. Activate
+      the IR retainer if one exists (CrowdStrike Services, Mandiant, etc.). Open a bridge
+      call. Time is critical: every minute of delay allows further encryption and lateral
+      movement. Do not attempt analysis on the affected host — isolate first, analyze later.
+    outputs:
+      - ir_team_assembled
+      - bridge_call_open
+      - ciso_notified
+      - retainer_activated
+
+  - id: step-2
+    name: IMMEDIATE — Network isolate all confirmed affected hosts
+    type: action
+    tool: edr
+    description: >
+      Mass isolate ALL hosts showing ransomware indicators simultaneously. Do not isolate
+      one at a time — the ransomware is spreading in parallel. Use EDR bulk containment.
+      If EDR is not available or bypassed, work with network team to VLAN segment or
+      physically disconnect affected segments. Preserve domain controllers — these need
+      special handling to avoid complete operational shutdown.
+    automation_hint: >
+      CrowdStrike bulk contain: POST https://api.crowdstrike.com/devices/entities/devices-actions/v2
+      {"action_name": "contain", "ids": ["<device_id_1>", "<device_id_2>", "..."]}
+      Emergency VLAN isolation: work with network team to implement ACLs blocking lateral traffic
+      CrowdStrike RTR bulk: use Falcon Fusion workflow to trigger on ransomware indicators automatically
+    outputs:
+      - isolated_hosts
+      - isolation_timestamp
+      - hosts_not_isolated
+
+  - id: step-3
+    name: Stop lateral movement — block SMB and RDP internally
+    type: action
+    tool: network_firewall
+    description: >
+      Implement emergency network ACLs to block SMB (445), RDP (3389), WMI (135), and
+      PsExec-related traffic between endpoint segments. This interrupts the ransomware's
+      primary lateral movement mechanisms. Accept the operational impact — this is necessary.
+      Do NOT block domain controller replication traffic (389, 88, 135 between DCs).
+    automation_hint: >
+      Cisco ASA: access-list BLOCK_RANSOMWARE_LATERAL deny tcp any any eq 445
+      access-list BLOCK_RANSOMWARE_LATERAL deny tcp any any eq 3389
+      Palo Alto: add security rule "block-ransomware-lateral" | action drop | application smb, msrdp | zones trust
+      CrowdStrike RTR: run "netsh advfirewall firewall add rule name='Block-SMB-Lateral' dir=out action=block protocol=TCP localport=445"
+    outputs:
+      - lateral_movement_blocked
+      - network_acl_id
+
+  - id: step-4
+    name: Identify patient zero and initial access vector
+    type: investigation
+    tool: edr
+    description: >
+      Identify the first host to exhibit ransomware behavior (patient zero) and trace back to
+      the initial access vector. Common vectors: phishing email with malicious attachment,
+      exposed RDP (credential brute force), VPN credential compromise, supply chain compromise,
+      or drive-by download. The initial access vector determines remediation scope.
+    automation_hint: >
+      CrowdStrike Threat Graph: find earliest process with ransomware IOC behavior
+      Splunk SPL: index=crowdstrike earliest=-6h event_type=DetectionSummaryEvent
+      | stats min(_time) as first_seen by ComputerName | sort first_seen | head 1
+      Review EDR process tree on patient zero for parent process of ransomware executable
+    outputs:
+      - patient_zero_hostname
+      - initial_access_vector
+      - infection_start_time
+      - ransomware_family
+
+  - id: step-5
+    name: Identify ransomware family and check for decryptors
+    type: investigation
+    tool: threat_intelligence_platform
+    description: >
+      Identify the ransomware strain from executable hash, ransom note text, or encrypted
+      file extension. Check ID Ransomware service. Look up known decryptors from NoMoreRansom
+      project, Emsisoft, or vendor-released tools. Contact CISA if critical infrastructure —
+      they may have intelligence or decryptors. Do NOT pay ransom without legal counsel sign-off.
+    automation_hint: >
+      ID Ransomware: POST https://id-ransomware.malwarehunterteam.com/api/ (upload sample)
+      NoMoreRansom: GET https://www.nomoreransom.org/crypto-sheriff.php
+      CrowdStrike Intel: GET https://api.crowdstrike.com/intel/combined/indicators/v1?filter=malware_families:*ransomware*
+      VirusTotal: POST https://www.virustotal.com/api/v3/files (upload ransomware sample)
+    outputs:
+      - ransomware_family
+      - decryptor_available
+      - ransomware_group
+      - known_iocs
+
+  - id: step-6
+    name: Assess encryption scope — what has been encrypted
+    type: investigation
+    tool: siem
+    description: >
+      Map the scope of encryption: how many hosts, which file shares, which systems. Check
+      file servers, NAS devices, SharePoint, backup systems, and databases. Determine if
+      backups were specifically targeted (many ransomware gangs target Veeam, shadow copies).
+      This is critical for the recovery decision — pay vs. restore from backup.
+    automation_hint: >
+      Splunk SPL: index=wineventlog EventCode=4663 earliest=-4h ObjectName="*.encrypted" OR ObjectName="*.<ext>"
+      | stats dc(ObjectName) as files_modified by ComputerName | sort -files_modified
+      Check shadow copies: vssadmin list shadows (run on suspected hosts via RTR)
+      CrowdStrike RTR: run "Get-ChildItem -Path C:\ -Recurse -Filter *.{ransom_ext} | Measure-Object | Select Count"
+    outputs:
+      - encrypted_hosts
+      - encrypted_file_count
+      - file_server_impact
+      - backup_system_status
+
+  - id: step-7
+    name: Verify backup integrity and recovery feasibility
+    type: investigation
+    tool: backup_system
+    description: >
+      IMMEDIATELY check backup system status: are backups intact and unencrypted? Were
+      the backup servers isolated/compromised? What is the most recent clean recovery point?
+      Can recovery meet the business RTO/RPO requirements? Contact backup vendor if backup
+      system shows signs of compromise. Do not use potentially compromised backups.
+    automation_hint: >
+      Veeam: Get-VBRRestorePoint | Sort-Object CreationTime -Descending | Select-Object -First 5
+      | Select-Object Name, CreationTime, IsCorrupted
+      AWS Backup: aws backup list-recovery-points-by-backup-vault --backup-vault-name default
+      Veeam REST API: GET https://<veeam_server>:9419/api/v1/restorePoints?backupId=<id>
+    outputs:
+      - backup_integrity_status
+      - latest_clean_backup_date
+      - recovery_time_estimate
+      - backup_coverage_gaps
+
+  - id: step-8
+    name: Preserve forensic artifacts from patient zero
+    type: action
+    tool: edr
+    description: >
+      Before any remediation of patient zero: collect forensic artifacts via EDR live response.
+      Capture: running process list, network connections, scheduled tasks, services, registry
+      run keys, event logs (before ransomware clears them), memory dump if executable is still
+      in memory. This is required for insurance, law enforcement, and understanding the attack.
+    automation_hint: >
+      CrowdStrike RTR forensic collection script:
+      run "Get-WinEvent -LogName Security -MaxEvents 1000 | Export-Csv security_log.csv"
+      run "netstat -ano > netstat.txt"
+      run "schtasks /query /fo CSV /v > scheduled_tasks.csv"
+      CrowdStrike Spotlight: GET https://api.crowdstrike.com/spotlight/queries/vulnerabilities/v1
+    outputs:
+      - forensic_artifacts_collected
+      - memory_dump_captured
+      - event_logs_preserved
+
+  - id: step-9
+    name: Report to law enforcement and cyber insurance
+    type: notification
+    description: >
+      Report to FBI IC3 (Internet Crime Complaint Center) — this is recommended and not
+      legally required but may provide intelligence support and notification if decryptor
+      exists. Notify cyber insurance carrier within the required timeframe (check policy).
+      CISA: report via cisa.gov/report if critical infrastructure. Preserve all evidence
+      for law enforcement — do not wipe systems yet.
+    outputs:
+      - law_enforcement_notified
+      - insurance_notified
+      - report_references
+
+  - id: step-10
+    name: Execute recovery plan — restore from clean backups
+    type: action
+    tool: backup_system
+    description: >
+      Begin recovery using clean, verified backups. Priority order: (1) domain controllers
+      and AD, (2) critical business systems, (3) file servers, (4) endpoint workstations.
+      Restore to quarantined environment first — do not restore directly to production.
+      Validate each system before reconnecting to the network. Re-image endpoints rather
+      than restoring from backup (backup may contain malware).
+    automation_hint: >
+      Veeam: Start-VBRRestoreVM -RestorePoint <point> -Server <esxi_host> -StorePath <datastore>
+      AWS: aws ec2 restore-snapshot-tier --snapshot-id <snap_id>
+      Verify restored system: run CrowdStrike full scan before reconnection
+    outputs:
+      - systems_restored
+      - restoration_priority_list
+      - reconnection_validation
+
+post_incident:
+  - Conduct full threat hunt to ensure no attacker persistence remains before declaring all-clear
+  - Perform root cause analysis and patch the initial access vector
+  - Engage forensic firm for comprehensive post-incident review and legal-quality report
+  - Review and test backup strategy — implement 3-2-1 rule with offline/air-gapped backups
+  - Implement network segmentation to limit blast radius of future ransomware incidents
+  - Deploy honeypot files (canary tokens) in file shares for early ransomware detection
+  - Conduct tabletop exercise for leadership team on ransomware response decision-making
+  - Notify customers, partners, and regulators as legally required
+  - Brief board of directors on incident, impact, and remediation investment required
+  - Commission a security maturity assessment to identify systemic gaps
+
+metrics:
+  avg_resolution_time: 240m
+  false_positive_rate: 2%
+  escalation_rate: 100%

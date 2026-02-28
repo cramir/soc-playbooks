@@ -1,0 +1,259 @@
+id: IR-001
+name: Phishing Email Investigation
+version: 1.0.0
+author: CostNimbus
+category: email-security
+severity: [medium, high]
+mitre_attack:
+  - T1566.001   # Spearphishing Attachment
+  - T1566.002   # Spearphishing Link
+  - T1598.003   # Spearphishing Link (Reconnaissance)
+  - T1204.001   # Malicious Link (User Execution)
+  - T1204.002   # Malicious File (User Execution)
+trigger:
+  - email_security_alert
+  - user_reported_phishing
+  - anti-phishing_gateway_block
+  - siem_correlation_rule
+tags:
+  - phishing
+  - email
+  - credential-theft
+  - bec
+  - spearphishing
+  - social-engineering
+tools_required:
+  - email_gateway
+  - edr
+  - siem
+  - threat_intelligence_platform
+  - url_sandbox
+estimated_time: 30m
+
+integrations:
+  - platform: defender_for_o365
+    optional: false
+    notes: "Microsoft Defender for Office 365 — Threat Explorer and quarantine management"
+  - platform: proofpoint_tap
+    optional: true
+    notes: "Proofpoint Targeted Attack Protection — alternative email security gateway"
+  - platform: crowdstrike_falcon
+    optional: true
+    notes: "Endpoint telemetry for recipients who may have clicked links"
+  - platform: splunk
+    optional: true
+    notes: "Correlation across email, proxy, and endpoint logs"
+  - platform: virustotal
+    optional: false
+    notes: "URL and hash reputation lookups for IOC extraction"
+
+steps:
+  - id: step-1
+    name: Triage and classify the alert
+    type: investigation
+    tool: email_gateway
+    description: >
+      Review the original alert or user report. Determine if this is a bulk phishing campaign,
+      targeted spearphishing, or Business Email Compromise (BEC). Check the sender domain age,
+      SPF/DKIM/DMARC alignment, and reply-to address. Flag BEC indicators (executive impersonation,
+      finance-themed lures, urgency language).
+    automation_hint: >
+      Microsoft Defender for O365 — Threat Explorer:
+      GET https://graph.microsoft.com/v1.0/security/threatIntelligence/hosts/{hostId}
+      Proofpoint TAP: GET https://tap-api-v2.proofpoint.com/v2/siem/messages/blocked?sinceSeconds=3600
+    outputs:
+      - email_id
+      - sender_address
+      - sender_ip
+      - email_classification
+      - recipient_list
+
+  - id: step-2
+    name: Quarantine suspicious email from all mailboxes
+    type: action
+    tool: email_gateway
+    description: >
+      Immediately quarantine the email from all recipient mailboxes — including forwarded copies.
+      Do not wait for user confirmation. Use hard delete or admin quarantine to prevent further access.
+      Log all affected recipients before removal.
+    automation_hint: >
+      Microsoft Defender for O365 PowerShell:
+      Search-Mailbox -SearchQuery "Subject:'<subject>'" -DeleteContent -Force
+      Or via REST: POST https://graph.microsoft.com/v1.0/admin/serviceAnnouncement/messages/archive
+      Proofpoint: POST https://tap-api-v2.proofpoint.com/v2/forensics with campaignId
+    outputs:
+      - quarantine_confirmation
+      - affected_recipient_count
+
+  - id: step-3
+    name: Extract all IOCs from email
+    type: investigation
+    tool: threat_intelligence_platform
+    description: >
+      Extract all indicators of compromise from the email headers, body, and attachments.
+      Collect: sender IP, sending mail server IP, reply-to address, all embedded URLs (including
+      redirectors), attachment names and SHA256 hashes, X-Originating-IP header.
+      Decode any URL-encoded or base64-encoded content.
+    automation_hint: >
+      CrowdStrike Falcon Intelligence:
+      POST https://api.crowdstrike.com/intel/entities/indicators/v1
+      VirusTotal URL scan: POST https://www.virustotal.com/api/v3/urls {"url": "<url>"}
+      Urlscan.io: POST https://urlscan.io/api/v1/scan/ {"url": "<url>", "visibility": "private"}
+    outputs:
+      - sender_ip
+      - urls
+      - file_hashes
+      - attachment_names
+      - mail_server_ips
+
+  - id: step-4
+    name: Check URL reputation and sandbox suspicious links
+    type: investigation
+    tool: url_sandbox
+    description: >
+      Submit all extracted URLs to a sandbox for detonation analysis. Check for credential
+      harvesting pages, drive-by downloads, or redirector chains. Note final landing page URL
+      and any dropped files or executed scripts. Cross-reference against threat intel feeds.
+    automation_hint: >
+      Any.run sandbox: POST https://api.any.run/v1/analysis {"obj_url": "<url>", "env_os": "Windows"}
+      VirusTotal: GET https://www.virustotal.com/api/v3/urls/{url_id}
+      Splunk SOAR: Run playbook "URL Reputation Check" action
+    outputs:
+      - url_verdict
+      - landing_page_url
+      - dropped_files
+      - credential_harvest_page_detected
+
+  - id: step-5
+    name: Identify users who opened email or clicked links
+    type: investigation
+    tool: siem
+    description: >
+      Query proxy logs, email gateway click logs, and EDR telemetry to identify any users who
+      opened the email or clicked embedded links. Check Defender for O365 URL click reports,
+      Proofpoint TRAP click data, or web proxy logs for destination URL hits in the timeframe.
+    automation_hint: >
+      Splunk SPL: index=proxy earliest=-1h src_ip IN (<recipient_ips>) url IN (<malicious_urls>)
+      | stats count by src_ip, url, _time
+      Defender for O365: GET https://graph.microsoft.com/v1.0/security/secureScoreControlProfiles
+      KQL (Sentinel): EmailUrlInfo | where Url in ("<urls>") | join EmailEvents on NetworkMessageId
+    outputs:
+      - clicked_users
+      - click_timestamps
+      - post_click_activity
+
+  - id: step-6
+    name: Assess credential compromise for clicking users
+    type: investigation
+    tool: edr
+    description: >
+      For each user who clicked links, check for credential submission to phishing sites via
+      browser telemetry. Review form submission events in CrowdStrike or Defender. Check if
+      the user's credentials appear in recent threat intel or paste sites. Review authentication
+      logs for anomalous logins (new geolocation, new device, impossible travel).
+    automation_hint: >
+      CrowdStrike: GET https://api.crowdstrike.com/incidents/queries/incidents/v1 with user filter
+      Azure AD Sign-in Logs (KQL): SigninLogs | where UserPrincipalName == "<user>" | where RiskLevel == "high"
+      HaveIBeenPwned: GET https://haveibeenpwned.com/api/v3/breachedaccount/<email>
+    outputs:
+      - compromised_accounts
+      - anomalous_login_events
+
+  - id: step-7
+    name: Reset credentials for compromised accounts
+    type: action
+    tool: identity_provider
+    description: >
+      For any accounts assessed as compromised: immediately revoke all active sessions and
+      OAuth tokens, reset password, enforce MFA re-enrollment. Notify user via out-of-band
+      channel (phone or secondary email). Do not notify via the potentially compromised
+      email account.
+    automation_hint: >
+      Azure AD (Graph API): POST https://graph.microsoft.com/v1.0/users/{userId}/revokeSignInSessions
+      Password reset: PATCH https://graph.microsoft.com/v1.0/users/{userId} {"passwordProfile": {"forceChangePasswordNextSignIn": true}}
+      CrowdStrike Identity: POST https://api.crowdstrike.com/identity-protection/entities/detections/v1
+    outputs:
+      - reset_confirmation
+      - session_revocation_confirmation
+
+  - id: step-8
+    name: Block IOCs across security controls
+    type: action
+    tool: email_gateway
+    description: >
+      Push extracted IOCs to blocking controls: add sender domain/IP to email gateway blocklist,
+      add malicious URLs to web proxy/DNS blocklist, add file hashes to EDR blocklist.
+      Create threat intel indicator objects for automated future blocking.
+    automation_hint: >
+      Defender for O365 block: POST https://graph.microsoft.com/v1.0/security/tiIndicators
+      CrowdStrike custom IOC: POST https://api.crowdstrike.com/iocs/entities/indicators/v1
+      Palo Alto Cortex: POST https://api.paloaltonetworks.com/xsoar/api/v2/incident/artifacts
+      Cisco Umbrella: POST https://management.api.umbrella.com/v1/organizations/{orgId}/destinationlists/{listId}/destinations
+    outputs:
+      - ioc_block_confirmations
+
+  - id: step-9
+    name: Search for similar emails across the organization
+    type: investigation
+    tool: email_gateway
+    description: >
+      Hunt for similar phishing emails using extracted IOCs. Search by sender domain, reply-to,
+      subject line patterns, URL patterns, and attachment hashes. Expand time window to 30 days
+      to catch campaign infrastructure. Quarantine any additional matches found.
+    automation_hint: >
+      Defender for O365 Threat Explorer: GET https://graph.microsoft.com/v1.0/security/threatIntelligence/hosts
+      Splunk SPL: index=email sourcetype=exchange sender_domain="<domain>" earliest=-30d | table recipient, subject, timestamp
+      Proofpoint TAP: GET https://tap-api-v2.proofpoint.com/v2/siem/messages/delivered?sinceSeconds=2592000
+    outputs:
+      - related_emails_found
+      - additional_quarantine_count
+
+  - id: step-10
+    name: Determine if escalation to IR team is needed
+    type: decision
+    description: >
+      Evaluate whether this requires full incident response engagement. Escalate if: credentials
+      were confirmed compromised, attacker established persistence (new OAuth grants, forwarding
+      rules), BEC with financial transaction, or campaign targeted C-suite. Otherwise close
+      as contained and proceed to post-incident steps.
+    outputs:
+      - escalation_decision
+      - escalation_reason
+
+  - id: step-11
+    name: Escalate to IR team if required
+    type: escalation
+    description: >
+      If escalation criteria met: open P1/P2 incident ticket, notify SOC lead, CISO, and legal
+      (if PII involved). Preserve email artifacts and chain of custody. Do not delete any
+      evidence. Brief IR team on timeline, IOCs, and confirmed compromise scope.
+    outputs:
+      - incident_ticket_id
+      - escalation_notification_sent
+
+  - id: step-12
+    name: Notify affected users and security awareness team
+    type: notification
+    description: >
+      Send out-of-band notification to all affected recipients informing them of the phishing
+      attempt, what to watch for (credential prompts, unexpected MFA requests), and who to
+      contact if they observe suspicious activity. Notify security awareness team to prepare
+      targeted training for the lure type used.
+    outputs:
+      - user_notification_sent
+      - awareness_team_notified
+
+post_incident:
+  - Update email gateway blocklists with all extracted IOCs (domain, IP, URL, hash)
+  - File incident report in ticketing system with full timeline and IOC list
+  - Notify affected users of phishing attempt via out-of-band channel
+  - Schedule targeted phishing awareness training within 5 business days
+  - Review and tighten SPF/DKIM/DMARC policies for own domains
+  - Add phishing lure indicators to anti-phishing simulation platform for future training
+  - Submit campaign indicators to threat sharing communities (ISACs, FS-ISAC if applicable)
+  - Review email gateway detection tuning — reduce false negatives for this campaign type
+
+metrics:
+  avg_resolution_time: 45m
+  false_positive_rate: 15%
+  escalation_rate: 8%

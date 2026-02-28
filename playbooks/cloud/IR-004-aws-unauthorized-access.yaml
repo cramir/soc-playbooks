@@ -1,0 +1,259 @@
+id: IR-004
+name: AWS Unauthorized Access via CloudTrail Anomaly
+version: 1.0.0
+author: CostNimbus
+category: cloud
+severity: [high, critical]
+mitre_attack:
+  - T1078.004   # Cloud Accounts (Valid Accounts)
+  - T1530       # Data from Cloud Storage Object
+  - T1552.005   # Cloud Instance Metadata API (Unsecured Credentials)
+  - T1537       # Transfer Data to Cloud Account
+  - T1098.001   # Additional Cloud Credentials
+  - T1619       # Cloud Storage Object Discovery
+  - T1580       # Cloud Infrastructure Discovery
+trigger:
+  - guardduty_finding
+  - cloudtrail_anomaly_alert
+  - siem_aws_unauthorized_api
+  - iam_credential_report_anomaly
+  - aws_security_hub_finding
+tags:
+  - aws
+  - cloud
+  - iam
+  - cloudtrail
+  - unauthorized-access
+  - data-exfiltration
+  - credential-compromise
+tools_required:
+  - aws_cloudtrail
+  - aws_guardduty
+  - aws_iam
+  - siem
+  - threat_intelligence_platform
+estimated_time: 40m
+
+integrations:
+  - platform: aws_guardduty
+    optional: false
+    notes: "Primary detection source for AWS threat detection"
+  - platform: aws_cloudtrail
+    optional: false
+    notes: "Full API audit trail — essential for investigation"
+  - platform: aws_security_hub
+    optional: true
+    notes: "Aggregated security findings across AWS accounts"
+  - platform: splunk
+    optional: true
+    notes: "CloudTrail log ingestion and SIEM correlation"
+  - platform: datadog
+    optional: true
+    notes: "Alternative cloud monitoring — CloudTrail integration"
+
+steps:
+  - id: step-1
+    name: Identify the compromised IAM principal
+    type: investigation
+    tool: aws_cloudtrail
+    description: >
+      Identify which IAM entity (user, role, or service account) is performing the unauthorized
+      actions. Review the GuardDuty finding or SIEM alert for the principal ARN. Determine
+      credential type: long-term access key, temporary STS token, or instance profile.
+      Check if the principal is a human user or machine identity (CI/CD, Lambda, EC2 role).
+    automation_hint: >
+      aws cloudtrail lookup-events --lookup-attributes AttributeKey=Username,AttributeValue=<principal>
+      --start-time $(date -d "2 hours ago" --iso-8601=seconds) --max-results 50
+      AWS CLI: aws guardduty get-findings --detector-id <detector_id> --finding-ids <finding_id>
+    outputs:
+      - compromised_principal_arn
+      - credential_type
+      - access_key_id
+      - source_ip
+      - user_agent
+
+  - id: step-2
+    name: Immediately disable or deactivate compromised credentials
+    type: action
+    tool: aws_iam
+    description: >
+      Disable the compromised access key or, if role-based, revoke all active sessions.
+      For IAM users: disable the access key, do NOT delete yet (preserve for investigation).
+      For roles: attach an inline deny-all policy as emergency brake. For STS temp credentials:
+      set the session policy to deny. This is the most critical containment step.
+    automation_hint: >
+      Disable access key: aws iam update-access-key --access-key-id <key_id> --status Inactive --user-name <user>
+      Revoke role sessions: aws iam put-role-policy --role-name <role> --policy-name EmergencyDeny
+      --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"*","Resource":"*"}]}'
+      Invalidate STS: aws sts get-caller-identity (confirm key invalid after disable)
+    outputs:
+      - credential_disabled
+      - deny_policy_attached
+      - containment_timestamp
+
+  - id: step-3
+    name: Enumerate all API actions performed with compromised credentials
+    type: investigation
+    tool: aws_cloudtrail
+    description: >
+      Pull complete CloudTrail event history for the compromised principal over the past 30 days
+      (or from key creation date). Focus on: IAM changes (new users, keys, policies), data access
+      (S3 GetObject, RDS queries), compute spawning (EC2, Lambda), networking changes (VPC, SGs),
+      and cross-account assumption attempts. Build a complete timeline.
+    automation_hint: >
+      aws cloudtrail lookup-events --lookup-attributes AttributeKey=AccessKeyId,AttributeValue=<key_id>
+      --start-time <start_iso> --end-time <end_iso> | jq '.Events[] | {time: .EventTime, event: .EventName, resources: .Resources}'
+      Athena query on S3 CloudTrail bucket:
+      SELECT eventTime, eventName, sourceIPAddress, userAgent, errorCode
+      FROM cloudtrail_logs WHERE userIdentity.accessKeyId = '<key_id>'
+      ORDER BY eventTime DESC LIMIT 500;
+    outputs:
+      - api_call_timeline
+      - sensitive_operations
+      - iam_changes_made
+      - data_accessed
+
+  - id: step-4
+    name: Identify resources created or modified by attacker
+    type: investigation
+    tool: aws_cloudtrail
+    description: >
+      Enumerate all AWS resources created, modified, or deleted by the attacker. Common attacker
+      actions: new IAM users/keys (persistence), new EC2 instances (cryptomining/C2), S3 bucket
+      policy changes (exfiltration), Lambda deployments (backdoor), new STS role trust relationships
+      (privilege escalation). Compile a complete resource inventory for remediation.
+    automation_hint: >
+      aws cloudtrail lookup-events --lookup-attributes AttributeKey=AccessKeyId,AttributeValue=<key_id>
+      --query 'Events[?contains(`["CreateUser","CreateAccessKey","RunInstances","CreateBucket"]`, EventName)]'
+      EC2 instances: aws ec2 describe-instances --filters "Name=tag:CreatedBy,Values=<principal>"
+      IAM new keys: aws iam list-access-keys (check all users for recently created keys)
+    outputs:
+      - attacker_created_resources
+      - persistence_mechanisms
+      - exfiltration_targets
+
+  - id: step-5
+    name: Assess S3 data exposure and exfiltration
+    type: investigation
+    tool: aws_cloudtrail
+    description: >
+      Review S3 access events for any sensitive data exfiltration. Check: GetObject calls on
+      sensitive buckets, PutBucketPolicy changes (public access), GetBucketAcl/PutBucketAcl,
+      PutObjectAcl (public objects), CreatePresignedUrl for external sharing. Cross-reference
+      with S3 access logs for actual data transferred.
+    automation_hint: >
+      S3 CloudTrail query (Athena):
+      SELECT bucketName, COUNT(*) as GetCount, SUM(bytes) as TotalBytes
+      FROM s3_access_logs WHERE requester = '<principal>'
+      AND operation = 'REST.GET.OBJECT'
+      AND requestdatetime > '<start_time>' GROUP BY bucketName ORDER BY TotalBytes DESC;
+      aws s3api get-bucket-policy --bucket <bucket_name>
+    outputs:
+      - exfiltrated_data_estimate
+      - accessed_buckets
+      - public_access_changes
+
+  - id: step-6
+    name: Identify and remove attacker persistence mechanisms
+    type: action
+    tool: aws_iam
+    description: >
+      Remove all persistence mechanisms created by the attacker: new IAM users and their
+      access keys, backdoor roles with external trust relationships, modified SCPs or permission
+      boundaries, new Lambda functions, CloudFormation stacks, or EC2 instances. Work through
+      the attacker resource inventory from step-4.
+    automation_hint: >
+      aws iam delete-access-key --access-key-id <key_id> --user-name <username>
+      aws iam delete-user --user-name <backdoor_user>
+      aws ec2 terminate-instances --instance-ids <attacker_instances>
+      aws lambda delete-function --function-name <backdoor_function>
+      aws iam delete-role --role-name <attacker_role>
+    outputs:
+      - persistence_removed
+      - resources_terminated
+
+  - id: step-7
+    name: Rotate all potentially exposed credentials and secrets
+    type: action
+    tool: aws_iam
+    description: >
+      Rotate all credentials that may have been exposed: the original compromised access key
+      (create new, delete old), any AWS Secrets Manager or Parameter Store values accessed,
+      database passwords, API keys for third-party services stored in AWS. For EC2 instance
+      profiles, replace with new roles.
+    automation_hint: >
+      aws iam create-access-key --user-name <user> (create new)
+      aws iam delete-access-key --access-key-id <old_key> (delete old)
+      aws secretsmanager rotate-secret --secret-id <secret_name>
+      aws ssm put-parameter --name <param_name> --value <new_value> --overwrite
+    outputs:
+      - credentials_rotated
+      - secrets_rotated
+
+  - id: step-8
+    name: Review and remediate IAM policy changes
+    type: action
+    tool: aws_iam
+    description: >
+      Review all IAM policy changes made during the attack window. Revert any policy
+      modifications, attached policies, or permission boundary changes. Use AWS Config history
+      to identify the pre-attack state and restore to it. Check trust policies on all roles
+      for external account trust additions.
+    automation_hint: >
+      aws configservice get-resource-config-history --resource-type AWS::IAM::Policy
+      --resource-id <policy_id> --limit 10
+      aws iam detach-user-policy --user-name <user> --policy-arn <attacker_policy>
+      Check trust policies: aws iam get-role --role-name <role> | jq '.Role.AssumeRolePolicyDocument'
+    outputs:
+      - iam_reverted
+      - trust_policies_reviewed
+
+  - id: step-9
+    name: Enable or verify enhanced monitoring
+    type: action
+    tool: aws_cloudtrail
+    description: >
+      Verify or enable enhanced monitoring for the affected account: CloudTrail in all regions
+      with S3 data events enabled, GuardDuty with all features enabled, AWS Config with all
+      rules, Security Hub with all standards, and VPC Flow Logs for all VPCs. Set CloudWatch
+      alarms for root account usage, unauthorized API calls, and high-value IAM operations.
+    automation_hint: >
+      aws guardduty update-detector --detector-id <id> --enable --data-sources
+      '{"S3Logs":{"Enable":true},"EKSAuditLogs":{"Enable":true},"MalwareProtection":{"ScanEc2InstanceWithFindings":{"EbsVolumes":{"Enable":true}}}}'
+      aws cloudtrail update-trail --name <trail> --enable-log-file-validation
+      --include-global-service-events --is-multi-region-trail
+    outputs:
+      - monitoring_enhanced
+
+  - id: step-10
+    name: Determine initial access vector
+    type: investigation
+    description: >
+      Investigate how the attacker obtained the credentials. Common sources: exposed in code
+      repository (GitHub secret scan), leaked via metadata endpoint (EC2 SSRF), phishing of
+      developer, insider threat, supply chain (compromised CI/CD), or from a third-party breach.
+      Check git history, CI/CD logs, and developer workstations.
+    automation_hint: >
+      GitHub: Search repo for access key pattern: git log -p | grep -E "AKIA[0-9A-Z]{16}"
+      GitGuardian API: GET https://api.gitguardian.com/v1/incidents?detector=aws_iam_key
+      Trufflesecurity/trufflehog: trufflehog git https://github.com/<org>/<repo>
+      Check IMDS: aws cloudtrail lookup-events --lookup-attributes AttributeKey=EventName,AttributeValue=GetInstanceMetadataServiceToken
+    outputs:
+      - initial_access_vector
+      - exposure_source
+
+post_incident:
+  - File security incident report with full API timeline, data impact assessment, and remediation steps
+  - Notify legal/compliance if sensitive data (PII, PCI, PHI) was accessed (potential breach notification)
+  - Implement SCPs to prevent dangerous IAM operations in production accounts
+  - Enable AWS Organizations Service Control Policies to block root account usage
+  - Rotate ALL access keys for the affected account as a precaution (not just the compromised key)
+  - Implement git-secrets or similar pre-commit hooks to prevent future credential exposure in code
+  - Conduct IAM access review — remove unused users, roles, and permissions (least privilege)
+  - Enable IAM Access Analyzer to continuously monitor for external access exposure
+  - Schedule quarterly AWS security posture review using AWS Security Hub
+
+metrics:
+  avg_resolution_time: 75m
+  false_positive_rate: 10%
+  escalation_rate: 40%

@@ -1,0 +1,221 @@
+id: IR-003
+name: Brute Force Authentication Attack
+version: 1.0.0
+author: CostNimbus
+category: identity
+severity: [medium, high]
+mitre_attack:
+  - T1110.001   # Password Guessing
+  - T1110.003   # Password Spraying
+  - T1110.004   # Credential Stuffing
+  - T1078       # Valid Accounts
+  - T1556.006   # Multi-Factor Authentication (Modify Authentication Process)
+trigger:
+  - siem_failed_login_threshold
+  - identity_provider_lockout_alert
+  - azure_ad_risky_sign_in
+  - okta_suspicious_activity_alert
+tags:
+  - brute-force
+  - credential-attack
+  - password-spray
+  - account-lockout
+  - authentication
+  - mfa
+tools_required:
+  - siem
+  - identity_provider
+  - threat_intelligence_platform
+  - network_firewall
+estimated_time: 20m
+
+integrations:
+  - platform: azure_active_directory
+    optional: false
+    notes: "Azure AD Sign-in Logs, Risky Users, Identity Protection"
+  - platform: okta
+    optional: true
+    notes: "Alternative IdP — System Log and ThreatInsight"
+  - platform: splunk
+    optional: false
+    notes: "Log aggregation and correlation across authentication sources"
+  - platform: palo_alto_prisma_access
+    optional: true
+    notes: "Geo-blocking and IP reputation enforcement at network edge"
+
+steps:
+  - id: step-1
+    name: Determine attack type and source
+    type: investigation
+    tool: siem
+    description: >
+      Classify the attack pattern: password spraying (few passwords, many accounts), credential
+      stuffing (known breach credentials), brute force (many passwords, one account), or MFA
+      fatigue attack. Identify the source: single IP, distributed IP range, TOR exit nodes,
+      VPN infrastructure, or botnet. Note timing patterns (distributed vs. rate-limited).
+    automation_hint: >
+      Splunk SPL: index=windows_security EventCode=4625 earliest=-1h
+      | stats count by src_ip, user | eval attack_type=if(dc(user)>10,"password_spray","brute_force")
+      | sort -count
+      Azure AD KQL: SigninLogs | where TimeGenerated > ago(1h) | where ResultType != "0"
+      | summarize FailureCount=count() by IPAddress, UserPrincipalName
+      | where FailureCount > 10
+    outputs:
+      - attack_type
+      - source_ips
+      - targeted_accounts
+      - failure_count
+
+  - id: step-2
+    name: Block attacking IP addresses
+    type: action
+    tool: network_firewall
+    description: >
+      Block the identified source IP addresses at the perimeter firewall and at the identity
+      provider level. For distributed attacks (botnet/TOR), block by ASN or geo-region if
+      business operations permit. Add IPs to WAF blacklist if attack is targeting web-based
+      authentication portals.
+    automation_hint: >
+      Azure AD Named Locations block: POST https://graph.microsoft.com/v1.0/identity/conditionalAccess/namedLocations
+      Okta Network Zone: PUT https://{domain}.okta.com/api/v1/zones/{zoneId} with blocked IPs
+      Cloudflare WAF: POST https://api.cloudflare.com/client/v4/zones/{zone_id}/firewall/access_rules/rules
+      {"mode": "block", "configuration": {"target": "ip", "value": "<src_ip>"}}
+    outputs:
+      - blocked_ips
+      - block_confirmation
+
+  - id: step-3
+    name: Identify accounts that successfully authenticated during attack window
+    type: investigation
+    tool: identity_provider
+    description: >
+      Search for any successful authentications from the attacking IPs or from targeted accounts
+      during and immediately after the attack window. A successful login during a brute force
+      attack indicates account compromise. Flag all accounts with successful auth from attack IPs,
+      even if they had previous failures.
+    automation_hint: >
+      Splunk SPL: index=windows_security EventCode=4624 src_ip IN (<attacking_ips>) earliest=-2h
+      | table _time, user, src_ip, LogonType | sort _time
+      Azure AD: SigninLogs | where IPAddress in ("<attacking_ips>") and ResultType == "0"
+      | project TimeGenerated, UserPrincipalName, IPAddress, Location, DeviceDetail
+    outputs:
+      - compromised_accounts
+      - successful_auth_timestamps
+      - compromised_account_activity
+
+  - id: step-4
+    name: Check if MFA was bypassed or is absent
+    type: investigation
+    tool: identity_provider
+    description: >
+      For any accounts with successful logins during the attack: verify whether MFA was
+      challenged. Check if MFA is even enforced for these accounts. Look for MFA fatigue
+      indicators (repeated push approvals from same user). Check for legacy protocol auth
+      (SMTP, POP, IMAP, NTLM) that bypasses MFA enforcement.
+    automation_hint: >
+      Azure AD: SigninLogs | where UserPrincipalName in ("<accounts>")
+      | where AuthenticationRequirement == "singleFactorAuthentication"
+      Okta: GET https://{domain}.okta.com/api/v1/logs?filter=eventType+eq+"user.authentication.auth_via_mfa"
+      Microsoft Graph: GET https://graph.microsoft.com/v1.0/users/{userId}/authentication/methods
+    outputs:
+      - mfa_bypass_confirmed
+      - accounts_without_mfa
+      - legacy_auth_usage
+
+  - id: step-5
+    name: Force session termination for compromised accounts
+    type: action
+    tool: identity_provider
+    description: >
+      Immediately revoke all active sessions and refresh tokens for identified compromised
+      accounts. This logs the attacker out of any established sessions. Also revoke any
+      OAuth application grants that may have been established during the compromise window.
+    automation_hint: >
+      Azure AD: POST https://graph.microsoft.com/v1.0/users/{userId}/revokeSignInSessions
+      Okta: POST https://{domain}.okta.com/api/v1/users/{userId}/sessions {"clearFactors": true}
+      Google Workspace: POST https://admin.googleapis.com/admin/directory/v1/users/{userKey}/signOut
+    outputs:
+      - sessions_revoked
+      - tokens_invalidated
+
+  - id: step-6
+    name: Reset passwords and enforce MFA for compromised accounts
+    type: action
+    tool: identity_provider
+    description: >
+      Force password reset for all compromised accounts — require strong password, deny
+      previous 24 passwords. Enforce MFA registration before next login. For accounts without
+      MFA, force enrollment. Notify users via out-of-band channel (phone) before reset to
+      avoid user confusion.
+    automation_hint: >
+      Azure AD: PATCH https://graph.microsoft.com/v1.0/users/{userId}
+      {"passwordProfile": {"forceChangePasswordNextSignIn": true, "password": "<temp_pw>"}}
+      Okta: POST https://{domain}.okta.com/api/v1/users/{userId}/lifecycle/reset_password
+      Enforce MFA: POST https://{domain}.okta.com/api/v1/users/{userId}/factors
+    outputs:
+      - password_resets_completed
+      - mfa_enforced_count
+
+  - id: step-7
+    name: Investigate post-compromise activity for successful logins
+    type: investigation
+    tool: siem
+    description: >
+      For any accounts with confirmed successful authentication during the attack: conduct
+      thorough investigation of all activity post-compromise. Look for: email rule creation,
+      data access and downloads, OAuth app grants, admin permission changes, new user creation,
+      external sharing of files.
+    automation_hint: >
+      Microsoft 365 Unified Audit Log: Search-UnifiedAuditLog -StartDate <date> -EndDate <date>
+      -UserIds "<user>" -RecordType ExchangeAdmin | Where-Object {$_.Operations -like "*Rule*"}
+      Splunk SPL: index=o365 user="<user>" earliest=<compromise_time>
+      | stats count by Operation | sort -count
+    outputs:
+      - post_compromise_activities
+      - data_access_events
+      - persistence_mechanisms_created
+
+  - id: step-8
+    name: Notify account owners and IT
+    type: notification
+    description: >
+      Notify affected account holders via out-of-band channel (phone, personal email, Slack DM)
+      about the attack and required password reset. Provide clear instructions. Notify IT
+      helpdesk to expect password reset calls — warn about social engineering attempts to
+      hijack the reset process.
+    outputs:
+      - notifications_sent
+      - helpdesk_briefed
+
+  - id: step-9
+    name: Review and strengthen authentication policies
+    type: investigation
+    tool: identity_provider
+    description: >
+      Review the effectiveness of existing controls: Are lockout policies configured correctly?
+      Is conditional access enforcing MFA from all locations? Are legacy auth protocols disabled?
+      Is there geo-blocking for unusual countries? Is risk-based authentication enabled?
+      Document any gaps for immediate remediation.
+    automation_hint: >
+      Azure AD: GET https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies
+      Okta: GET https://{domain}.okta.com/api/v1/policies?type=PASSWORD
+      Check legacy auth: SigninLogs | where ClientAppUsed in ("IMAP4","POP3","SMTP","Exchange ActiveSync")
+    outputs:
+      - policy_gaps
+      - lockout_policy_config
+      - legacy_auth_exposure
+
+post_incident:
+  - Block attacking IP ranges permanently at perimeter and IdP level
+  - Enable risk-based conditional access policies if not already active
+  - Disable legacy authentication protocols (IMAP, POP, SMTP Auth, Basic Auth) organization-wide
+  - Enforce FIDO2/hardware MFA for privileged accounts and executive accounts
+  - File incident report documenting attack source, timeline, targeted accounts, and outcomes
+  - Notify CISO and legal if any accounts confirmed compromised (potential data breach notification requirement)
+  - Run quarterly password hygiene review — check against known breach credential databases
+  - Review and update account lockout thresholds based on attack pattern observed
+
+metrics:
+  avg_resolution_time: 35m
+  false_positive_rate: 20%
+  escalation_rate: 15%

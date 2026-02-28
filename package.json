@@ -1,0 +1,32 @@
+{
+  "name": "soc-playbook-automation-library",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Free, open-source incident response playbooks for modern SOC teams — by CostNimbus",
+  "scripts": {
+    "validate": "node schema/validate.js",
+    "validate:single": "node schema/validate.js"
+  },
+  "keywords": [
+    "soc",
+    "playbook",
+    "incident-response",
+    "security",
+    "mitre-attack",
+    "soar",
+    "blue-team",
+    "cybersecurity"
+  ],
+  "author": "CostNimbus <security@costnimbus.io>",
+  "license": "MIT",
+  "dependencies": {
+    "js-yaml": "^4.1.0",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "glob": "^10.4.5",
+    "chalk": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

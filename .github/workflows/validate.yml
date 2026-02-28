@@ -1,0 +1,60 @@
+name: Validate Playbooks
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'playbooks/**'
+      - 'schema/**'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'playbooks/**'
+      - 'schema/**'
+
+jobs:
+  validate:
+    name: Schema Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate all playbooks against schema
+        run: npm run validate
+
+      - name: Count playbooks
+        if: always()
+        run: |
+          count=$(find playbooks/ -name "*.yaml" -o -name "*.yml" | wc -l)
+          echo "::notice::Total playbooks in library: $count"
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "## ✅ Playbook Validation Passed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All playbooks conform to the schema." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stat | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          total=$(find playbooks/ -name "*.yaml" -o -name "*.yml" | wc -l)
+          echo "| Total Playbooks | $total |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Failure Summary
+        if: failure()
+        run: |
+          echo "## ❌ Playbook Validation Failed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "One or more playbooks failed schema validation." >> $GITHUB_STEP_SUMMARY
+          echo "Run \`npm run validate\` locally to see errors." >> $GITHUB_STEP_SUMMARY

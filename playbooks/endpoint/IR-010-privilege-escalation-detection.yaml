@@ -1,0 +1,282 @@
+id: IR-010
+name: Privilege Escalation Detection and Response
+version: 1.0.0
+author: CostNimbus
+category: endpoint
+severity: [high, critical]
+mitre_attack:
+  - T1068       # Exploitation for Privilege Escalation
+  - T1548.002   # Bypass User Account Control
+  - T1548.003   # Sudo and Sudo Caching (Linux)
+  - T1134.001   # Token Impersonation/Theft
+  - T1134.002   # Create Process with Token
+  - T1055       # Process Injection
+  - T1078.003   # Local Accounts (Valid Accounts)
+  - T1484.001   # Group Policy Modification (Domain Policy Modification)
+  - T1098       # Account Manipulation
+trigger:
+  - edr_privilege_escalation_alert
+  - siem_admin_group_change
+  - siem_sudo_to_root_anomaly
+  - windows_event_4672
+  - windows_event_4673
+  - ad_group_membership_change
+  - siem_uac_bypass_technique
+tags:
+  - privilege-escalation
+  - uac-bypass
+  - token-manipulation
+  - admin-rights
+  - windows
+  - linux
+  - active-directory
+  - lateral-movement-precursor
+tools_required:
+  - edr
+  - siem
+  - identity_provider
+  - pam_solution
+  - active_directory
+estimated_time: 30m
+
+integrations:
+  - platform: crowdstrike_falcon
+    optional: false
+    notes: "Privilege escalation behavioral detection and process tree analysis"
+  - platform: microsoft_defender_for_endpoint
+    optional: true
+    notes: "Alternative EDR — Windows-native privilege escalation detection"
+  - platform: splunk
+    optional: false
+    notes: "Windows Event Log correlation, AD event monitoring"
+  - platform: cyberark_pam
+    optional: true
+    notes: "Privileged Access Management — session recording and credential vaulting"
+  - platform: azure_active_directory
+    optional: false
+    notes: "Azure AD / on-prem AD — group membership and role assignment audit"
+
+steps:
+  - id: step-1
+    name: Identify the escalation technique and affected user
+    type: investigation
+    tool: edr
+    description: >
+      Determine the privilege escalation method used: UAC bypass (common techniques: fodhelper,
+      eventvwr, ComputerDefaults), token impersonation (SeImpersonatePrivilege), process injection
+      into higher-privileged process, kernel exploit, sudo misconfiguration (Linux), SUID binary
+      abuse (Linux), or direct AD group modification. Identify the affected user account —
+      was this a standard user who escalated, or a service account? Is this a known-good
+      administrator activity or clearly malicious?
+    automation_hint: >
+      CrowdStrike: GET https://api.crowdstrike.com/detections/entities/summaries/GET/v1 {"ids": ["<detection_id>"]}
+      Review detection technique field and process tree
+      Windows Event Log: Get-WinEvent -FilterHashtable @{LogName='Security';Id=4672}
+      | Where-Object {$_.Properties[1].Value -notlike "*Administrator*"}
+      Linux: ausearch -m USER_ROLE_CHANGE -ts recent | grep -v "root"
+    outputs:
+      - escalation_technique
+      - escalation_user
+      - target_privilege_level
+      - affected_host
+      - detection_confidence
+
+  - id: step-2
+    name: Capture process tree and execution context
+    type: investigation
+    tool: edr
+    description: >
+      Pull the complete process tree for the escalation event: the process that initiated
+      the escalation, parent process, any child processes spawned with elevated privileges,
+      and command-line arguments. Determine what the attacker did with elevated privileges
+      immediately after escalation — this reveals their objective (lateral movement, persistence,
+      data access, credential dumping).
+    automation_hint: >
+      CrowdStrike: GET https://api.crowdstrike.com/events/combined/events/v1
+      ?filter=device_id:'<device_id>' + timestamp:>='<detection_time-5m>'
+      Splunk SPL: index=wineventlog EventCode IN (4672,4673,4688) ComputerName="<hostname>"
+      earliest=<detection_time-5m> | table _time, EventCode, SubjectUserName, ProcessName, NewProcessName, CommandLine
+    outputs:
+      - process_tree
+      - parent_process
+      - post_escalation_commands
+      - spawned_processes
+
+  - id: step-3
+    name: Determine if this is a compromised account or lateral movement
+    type: investigation
+    tool: siem
+    description: >
+      Assess the context: is this a legitimate administrator who normally has these rights?
+      Is the escalation happening from an unusual workstation for this user? Was there
+      a recent authentication event from unusual IP/location for this account? Check if
+      the account was recently used for phishing or brute force. Lateral movement from a
+      compromised lower-privileged account escalating is a red flag.
+    automation_hint: >
+      Splunk SPL: index=windows_security EventCode=4624 Account_Name="<user>" earliest=-24h
+      | stats count by Source_Network_Address, Logon_Type | sort _time
+      Azure AD: SigninLogs | where UserPrincipalName == "<user>" | where TimeGenerated > ago(24h)
+      | project TimeGenerated, IPAddress, Location, RiskLevel, RiskEventTypes
+    outputs:
+      - account_compromise_likelihood
+      - unusual_auth_events
+      - lateral_movement_indicators
+
+  - id: step-4
+    name: Check for AD group membership changes and domain privilege escalation
+    type: investigation
+    tool: active_directory
+    description: >
+      Check if the escalation included changes to Active Directory: was the user added to
+      Domain Admins, Enterprise Admins, Schema Admins, or other privileged groups? Were new
+      GPOs created or modified? Were new local admin accounts created on the host? Were
+      domain trust relationships modified? AD-level privilege escalation is significantly
+      more severe than local privilege escalation.
+    automation_hint: >
+      Windows Event Log: Get-WinEvent -FilterHashtable @{LogName='Security';Id=4728,4732,4756}
+      | Select-Object TimeCreated, Message | Where-Object {$_.Message -match "Domain Admins|Enterprise Admins"}
+      Splunk: index=wineventlog EventCode IN (4728,4732,4756) earliest=-1h | table _time, EventCode, MemberName, GroupName, SubjectUserName
+      AD PowerShell: Get-ADGroupMember "Domain Admins" | Select-Object SamAccountName, WhenCreated
+    outputs:
+      - ad_group_changes
+      - domain_admin_access_gained
+      - gpo_modifications
+      - domain_escalation_confirmed
+
+  - id: step-5
+    name: Hunt for credential dumping activity
+    type: investigation
+    tool: edr
+    description: >
+      Privilege escalation is frequently followed by credential dumping to enable lateral
+      movement. Hunt for: LSASS memory access (Mimikatz patterns), Volume Shadow Copy access
+      (ntds.dit theft), DCSync activity, SAM registry hive reads, DPAPI master key abuse,
+      or network credential capture. Credential dumping from an elevated context is a
+      major escalation in incident severity.
+    automation_hint: >
+      CrowdStrike: detect LSASS access — GET https://api.crowdstrike.com/indicators/queries/processes/v1
+      ?filter=indicator_value:'lsass.exe'
+      Splunk (Sysmon EventCode=10): index=sysmon EventCode=10 TargetImage="*lsass.exe"
+      NOT SourceImage IN ("*MsMpEng.exe","*svchost.exe","*wininit.exe")
+      | table _time, SourceImage, SourceCommandLine, GrantedAccess
+      DCSync detection: index=wineventlog EventCode=4662 Properties="*1131f6aa*"
+    outputs:
+      - credential_dumping_confirmed
+      - lsass_access_detected
+      - dcsync_detected
+      - credentials_at_risk
+
+  - id: step-6
+    name: Isolate affected host if escalation is confirmed malicious
+    type: action
+    tool: edr
+    description: >
+      If privilege escalation is confirmed malicious (not authorized admin activity):
+      isolate the endpoint immediately. For domain-level escalation, also disable the
+      affected account in AD to prevent lateral movement using newly acquired privileges.
+      For domain controller compromise: follow the ransomware/critical incident playbook —
+      this is a P0 event.
+    automation_hint: >
+      CrowdStrike contain: POST https://api.crowdstrike.com/devices/entities/devices-actions/v2
+      {"action_name": "contain", "ids": ["<device_id>"]}
+      AD disable account: Disable-ADAccount -Identity <username>
+      Revoke Azure AD sessions: POST https://graph.microsoft.com/v1.0/users/{userId}/revokeSignInSessions
+    outputs:
+      - host_isolated
+      - account_disabled
+      - isolation_timestamp
+
+  - id: step-7
+    name: Remove unauthorized privilege grants and reverse AD changes
+    type: action
+    tool: active_directory
+    description: >
+      Reverse all unauthorized privilege changes: remove attacker account from privileged AD
+      groups, revert modified GPOs to previous state using AD backup or Group Policy restore,
+      remove local admin rights granted on endpoints, revoke newly created service accounts
+      or local accounts. Use AD change audit logs to identify every modification and revert each.
+    automation_hint: >
+      Remove from group: Remove-ADGroupMember -Identity "Domain Admins" -Members "<username>" -Confirm:$false
+      Revert GPO: Restore-GPO -Name "<GPO_Name>" -Path "<backup_path>"
+      Local admin removal: net localgroup Administrators <username> /delete
+      Revoke Azure AD role: Remove-MgUserAppRoleAssignment -UserId <userId> -AppRoleAssignmentId <id>
+    outputs:
+      - privilege_grants_reverted
+      - ad_changes_reversed
+      - local_admin_removed
+
+  - id: step-8
+    name: Patch the vulnerability or misconfiguration exploited
+    type: action
+    description: >
+      Identify and remediate the root cause. For CVE-based kernel exploits: emergency patch
+      the OS. For UAC bypass techniques: enforce UAC level 2 (Always Notify) and disable known
+      bypass tools via AppLocker/WDAC. For sudo misconfigurations (Linux): remove NOPASSWD entries,
+      audit sudoers file. For SUID binary abuse: remove unnecessary SUID bits. For SeImpersonatePrivilege
+      abuse (potato attacks): upgrade OS or remove unnecessary service accounts with this privilege.
+    automation_hint: >
+      Windows UAC hardening: Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "ConsentPromptBehaviorAdmin" -Value 2
+      AppLocker: Set-AppLockerPolicy -XMLPolicy <policy_xml>
+      Linux sudoers audit: visudo -c && grep -E "NOPASSWD|ALL.*ALL" /etc/sudoers /etc/sudoers.d/*
+      SUID check: find / -perm -4000 -type f 2>/dev/null | xargs ls -la
+    outputs:
+      - vulnerability_patched
+      - misconfiguration_remediated
+      - control_strengthened
+
+  - id: step-9
+    name: Assess lateral movement from elevated context
+    type: investigation
+    tool: siem
+    description: >
+      With elevated privileges, the attacker may have moved laterally to other systems.
+      Hunt for: authentication events from the compromised host/account to other systems,
+      RDP/WMI/PsExec connections with new admin credentials, network scanning from the
+      escalated context, and new processes spawned on remote systems. Expand scope if
+      lateral movement is confirmed.
+    automation_hint: >
+      Splunk SPL: index=wineventlog (EventCode=4624 OR EventCode=4648) src_ip="<compromised_ip>"
+      NOT dest_ip="<compromised_ip>" earliest=<escalation_time>
+      | stats count by dest_ip, Account_Name, LogonType
+      CrowdStrike: search lateral movement detections linked to <device_id>
+      GET https://api.crowdstrike.com/incidents/queries/behaviors/v1?filter=device_id:'<id>'
+    outputs:
+      - lateral_movement_targets
+      - additional_compromised_hosts
+      - lateral_movement_scope
+
+  - id: step-10
+    name: Force password rotation for all accounts used during escalation
+    type: action
+    tool: identity_provider
+    description: >
+      Force immediate password resets for: the escalated account, any accounts whose credentials
+      were dumped or accessed during the escalation window, service accounts on the affected
+      host, and any accounts that authenticated to the host from an external location after
+      the escalation. Reset Kerberos service account keys (krbtgt) if AD was accessed by the attacker.
+    automation_hint: >
+      AD bulk reset: Get-ADUser -Filter * -SearchBase "OU=Users,DC=corp,DC=com" | Set-ADUser -ChangePasswordAtLogon $true
+      krbtgt reset (if AD compromise): Reset-KrbtgtKeyInteractive (run twice for full propagation)
+      Azure AD: PATCH https://graph.microsoft.com/v1.0/users/{userId} {"passwordProfile": {"forceChangePasswordNextSignIn": true}}
+      Service account rotation: script to rotate all service account passwords stored in AD
+    outputs:
+      - passwords_reset
+      - krbtgt_rotated
+      - service_accounts_rotated
+
+post_incident:
+  - Deploy Privileged Access Workstations (PAWs) for all administrators — prevent admin activity from standard workstations
+  - Implement Just-In-Time (JIT) privileged access — eliminate standing admin accounts
+  - Deploy CyberArk or similar PAM solution for credential vaulting and session recording
+  - Review and harden local administrator account policy — disable built-in Administrator, randomize LAPS passwords
+  - Enforce principle of least privilege — audit all AD group memberships and remove excessive access
+  - "Implement Tier Model for Active Directory (Tier 0: DCs, Tier 1: Servers, Tier 2: Workstations)"
+  - Enable Windows Defender Credential Guard to protect LSASS from credential dumping
+  - Configure Windows Audit Policy for enhanced privilege use monitoring
+  - File incident report with root cause, remediation steps, and systemic control improvements
+  - Conduct purple team exercise focused on privilege escalation and lateral movement
+
+metrics:
+  avg_resolution_time: 60m
+  false_positive_rate: 12%
+  escalation_rate: 35%

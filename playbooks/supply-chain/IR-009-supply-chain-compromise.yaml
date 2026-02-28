@@ -1,0 +1,297 @@
+id: IR-009
+name: Software Supply Chain Compromise
+version: 1.0.0
+author: CostNimbus
+category: supply-chain
+severity: [critical]
+mitre_attack:
+  - T1195.001   # Compromise Software Dependencies and Development Tools
+  - T1195.002   # Compromise Software Supply Chain
+  - T1554       # Compromise Client Software Binary
+  - T1059.001   # PowerShell (malicious package execution)
+  - T1059.004   # Unix Shell (malicious package post-install scripts)
+  - T1105       # Ingress Tool Transfer
+  - T1071.001   # Web Protocols (C2 via compromised package)
+  - T1068       # Exploitation for Privilege Escalation (via CI/CD)
+trigger:
+  - security_advisory_for_used_dependency
+  - siem_known_malicious_package_hash
+  - ci_cd_anomalous_behavior
+  - edr_post_install_script_alert
+  - threat_intel_feed_package_compromise
+  - developer_reported_anomaly
+tags:
+  - supply-chain
+  - dependency-compromise
+  - open-source
+  - npm
+  - pypi
+  - go-modules
+  - ci-cd
+  - solarwinds-style
+tools_required:
+  - siem
+  - edr
+  - sca_tool
+  - ci_cd_platform
+  - artifact_registry
+estimated_time: 120m
+
+integrations:
+  - platform: snyk
+    optional: false
+    notes: "Software Composition Analysis — package vulnerability and malware detection"
+  - platform: crowdstrike_falcon
+    optional: false
+    notes: "Endpoint detection of post-install script execution and C2 communication"
+  - platform: github_advanced_security
+    optional: true
+    notes: "Dependency graph and secret scanning in source code"
+  - platform: jfrog_xray
+    optional: true
+    notes: "Artifact scanning in internal package registry"
+  - platform: splunk
+    optional: false
+    notes: "CI/CD pipeline log correlation and network telemetry"
+
+steps:
+  - id: step-1
+    name: Confirm the compromised package and affected versions
+    type: investigation
+    tool: sca_tool
+    description: >
+      Identify the exact package, ecosystem (npm, PyPI, Go modules, Maven, NuGet, RubyGems),
+      and affected version range. Obtain the security advisory (GitHub Advisory, NVD, OSV.dev,
+      or vendor bulletin). Confirm the nature of the compromise: malicious code injected into
+      legitimate package, typosquatting package, dependency confusion attack, or compromised
+      package maintainer account. Understand what the malicious code does (data theft, RAT,
+      cryptominer, backdoor, destructive payload).
+    automation_hint: >
+      OSV.dev: GET https://api.osv.dev/v1/query {"package": {"name": "<pkg>", "ecosystem": "npm"}}
+      GitHub Advisory: GET https://api.github.com/advisories?ghsaid=<id>
+      Snyk: GET https://snyk.io/api/v1/test/npm/<package>/<version>
+      npm audit: npm audit --json | jq '.vulnerabilities.<package>'
+    outputs:
+      - compromised_package
+      - affected_versions
+      - malicious_behavior
+      - cve_or_ghsa_id
+      - compromise_type
+
+  - id: step-2
+    name: Identify all internal codebases using the compromised package
+    type: investigation
+    tool: sca_tool
+    description: >
+      Search all internal repositories, build artifacts, Docker images, and deployed applications
+      for use of the compromised package and version. Include: direct dependencies, transitive
+      dependencies (the package may be 3 levels deep), vendored copies, and Docker base image
+      layers. Use SCA tooling across all repos, not just manifest files — check lock files.
+    automation_hint: >
+      Snyk: POST https://snyk.io/api/v1/org/{orgId}/test (scan all projects)
+      GitHub Code Search: GET https://api.github.com/search/code?q=<package_name>+in:file+org:<org>
+      Dependency-track: GET https://<server>/api/v1/component?purl=pkg:npm/<pkg>@<version>
+      Docker image scan: grype <image_name> --only-fixed
+      find / -name "package-lock.json" | xargs grep -l "<package_name>"
+    outputs:
+      - affected_repositories
+      - affected_applications
+      - affected_docker_images
+      - total_exposure_scope
+
+  - id: step-3
+    name: Determine if malicious package was executed in any environment
+    type: investigation
+    tool: edr
+    description: >
+      Determine execution exposure: was the package only listed in dependencies (unused code path)
+      or was it actually executed? Were the post-install scripts run (most dangerous — execute
+      on npm install/pip install)? In which environments: developer workstations, CI/CD runners,
+      production systems, test environments? Each executed environment is a potentially
+      compromised system requiring investigation.
+    automation_hint: >
+      CrowdStrike: search for process ancestry from npm/pip/go with malicious package path
+      GET https://api.crowdstrike.com/events/combined/events/v1
+      Splunk SPL: index=crowdstrike sourcetype=crowdstrike:events ImageFileName="*node_modules*<package>*"
+      CI/CD: review build logs for package installation output with error/anomaly indicators
+      npm: check if preinstall/postinstall scripts exist: cat node_modules/<package>/package.json | jq '.scripts'
+    outputs:
+      - execution_confirmed
+      - execution_environments
+      - post_install_scripts_run
+      - production_exposure
+
+  - id: step-4
+    name: Isolate compromised CI/CD runners and build systems
+    type: action
+    tool: edr
+    description: >
+      If CI/CD runners executed the malicious package: immediately isolate all affected
+      build agents/runners from the network. This is critical — CI/CD systems have broad
+      access to source code, secrets, artifact registries, and deployment credentials.
+      A compromised CI/CD runner may have exfiltrated all build secrets. Suspend all
+      pipelines until runners are verified clean.
+    automation_hint: >
+      CrowdStrike: POST https://api.crowdstrike.com/devices/entities/devices-actions/v2
+      {"action_name": "contain", "ids": ["<runner_host_ids>"]}
+      GitHub Actions: disable affected workflows via API:
+      PUT https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow_id}/disable
+      GitLab: PUT https://gitlab.com/api/v4/runners/{runner_id} {"active": false}
+    outputs:
+      - runners_isolated
+      - pipelines_suspended
+      - isolation_scope
+
+  - id: step-5
+    name: Rotate all secrets potentially exposed in CI/CD
+    type: action
+    description: >
+      Rotate ALL secrets that were accessible to compromised CI/CD environments. This includes:
+      deployment credentials (AWS, GCP, Azure), container registry credentials, npm/PyPI publish
+      tokens, GitHub/GitLab tokens, Kubernetes service account tokens, database credentials,
+      API keys, and any secrets stored in pipeline environment variables or secret managers.
+      This is comprehensive — when CI/CD is compromised, assume all secrets are stolen.
+    automation_hint: >
+      AWS: rotate all IAM access keys used by CI/CD roles
+      GitHub: POST https://api.github.com/repos/{owner}/{repo}/actions/secrets/{secret_name}
+      Docker Hub: revoke and reissue all access tokens
+      Kubernetes: kubectl delete secret <secret> -n <namespace> && kubectl create secret generic ...
+      Vault: vault lease revoke -prefix auth/
+    outputs:
+      - secrets_rotated
+      - rotation_scope
+      - credentials_revoked
+
+  - id: step-6
+    name: Investigate for malicious payload execution and C2 activity
+    type: investigation
+    tool: siem
+    description: >
+      On all systems that executed the malicious package: hunt for indicators of the payload.
+      Common supply chain payloads: DNS beaconing to attacker infrastructure, credential
+      harvesting (env vars, .ssh, .aws, .kube), file system modification, reverse shell
+      establishment, or cryptominer deployment. Check network logs for connections to attacker
+      C2 infrastructure identified in the advisory.
+    automation_hint: >
+      Splunk SPL: index=proxy earliest=-7d src_ip IN (<affected_ips>) dest_domain IN (<known_c2>)
+      | stats count by src_ip, dest_domain, _time
+      CrowdStrike: search network events from affected hosts for external connections
+      DNS hunting: index=dns query IN (<malicious_domains>) | stats count by query, src_ip
+      Check env variable theft: look for POST requests to external IPs from CI/CD IP range
+    outputs:
+      - c2_communication_detected
+      - data_exfiltrated
+      - payload_behavior
+      - affected_timeframe
+
+  - id: step-7
+    name: Remove malicious package and update all dependencies
+    type: action
+    tool: artifact_registry
+    description: >
+      Update the compromised package to a safe version in all affected repositories. If no
+      safe version exists, remove the dependency entirely. Update package lock files, rebuild
+      Docker images, and push updated base images. Remove any cached versions from internal
+      artifact registries (JFrog Artifactory, Nexus, GitHub Packages). Clear npm/pip/go
+      caches on build systems.
+    automation_hint: >
+      npm: npm install <package>@<safe_version> && npm audit fix
+      pip: pip install "<package>>=<safe_version>"
+      Go: go get <module>@<safe_version> && go mod tidy
+      JFrog: DELETE https://<server>/artifactory/<repo>/<path>/<malicious_version>
+      Docker: rebuild all images FROM updated base images
+    outputs:
+      - packages_updated
+      - lock_files_updated
+      - images_rebuilt
+      - cache_cleared
+
+  - id: step-8
+    name: Re-image compromised developer workstations and build servers
+    type: action
+    tool: edr
+    description: >
+      For all systems confirmed to have executed the malicious payload: full re-image is required.
+      Do not attempt to clean — supply chain compromises often establish deep persistence.
+      For developer workstations: preserve user data (personal files), wipe OS and reinstall.
+      For CI/CD runners: terminate and replace with new instances from golden image.
+      Rotate any credentials stored locally (ssh keys, .aws/credentials, .kube/config).
+    automation_hint: >
+      AWS EC2 runner: aws ec2 terminate-instances --instance-ids <runner_ids>
+      then launch new from golden AMI
+      Intune (workstations): POST https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/{id}/wipe
+      CrowdStrike RTR: collect forensic artifacts before wipe
+    outputs:
+      - systems_reimaged
+      - new_runners_provisioned
+      - developer_impact_count
+
+  - id: step-9
+    name: Assess if malicious code reached production deployments
+    type: investigation
+    description: >
+      The highest severity scenario: did any artifacts built with the compromised package get
+      deployed to production? Identify all production deployments using affected artifact versions.
+      Check deployment timestamps against compromise window. If yes, escalate to full incident
+      response: production systems may be compromised, and customers/users may be affected.
+    automation_hint: >
+      Check deployed versions: kubectl get deployments --all-namespaces -o json
+      | jq '.items[].spec.template.spec.containers[].image'
+      AWS ECS: aws ecs describe-task-definition --task-definition <name>
+      Review deployment history in CD tool (ArgoCD, Spinnaker, Helm) for affected artifact versions
+    outputs:
+      - production_affected
+      - customer_impact_assessment
+      - affected_deployment_versions
+
+  - id: step-10
+    name: Implement supply chain security controls
+    type: action
+    tool: ci_cd_platform
+    description: >
+      Immediately implement controls to prevent future supply chain attacks: pin all dependencies
+      to exact versions with hash verification (npm --package-lock, pip --require-hashes),
+      implement SCA scanning in CI/CD pipeline as a blocking step, set up private mirror of
+      critical packages, enable Sigstore/cosign for package signature verification, configure
+      Dependabot for automated security updates.
+    automation_hint: >
+      npm: set package-lock=true and use npm ci (immutable installs)
+      pip: pip-compile --generate-hashes requirements.in
+      GitHub Dependabot: create .github/dependabot.yml
+      Sigstore: cosign verify <image>@sha256:<digest> --certificate-identity=...
+      Policy-as-code: use OPA/Conftest to enforce dependency pinning in CI
+    outputs:
+      - hash_pinning_enabled
+      - sca_in_pipeline
+      - dependabot_configured
+      - package_signing_verified
+
+  - id: step-11
+    name: Notify customers and regulators if production was affected
+    type: notification
+    description: >
+      If production systems running customer workloads were compromised: notify affected
+      customers with full disclosure of impact scope. Engage Legal for breach notification
+      obligations (GDPR, CCPA, SOC 2 requirements). Prepare public disclosure statement if
+      material to publicly traded company. Notify CISA if critical infrastructure. Coordinate
+      timing of notifications with legal and PR.
+    outputs:
+      - customer_notifications_sent
+      - regulator_notifications_sent
+      - public_disclosure_prepared
+
+post_incident:
+  - Commission a complete SBOM (Software Bill of Materials) for all products — know what you're running
+  - Implement private package mirror with allowlist for approved packages and versions
+  - Enable continuous SCA scanning across all repositories in CI/CD
+  - Implement SLSA (Supply-chain Levels for Software Artifacts) framework for build integrity
+  - "Establish a process for rapid response to new CVEs in dependencies (target: 24h patch window)"
+  - Conduct tabletop exercise focused on supply chain attack scenarios with engineering leadership
+  - Subscribe to relevant security advisory feeds (GitHub Advisories, OSV, CVE) with automated alerting
+  - "Review and minimize blast radius: CI/CD should use least-privilege credentials, not admin access"
+  - File public post-mortem to contribute to community knowledge (coordinate with Legal)
+
+metrics:
+  avg_resolution_time: 480m
+  false_positive_rate: 5%
+  escalation_rate: 80%

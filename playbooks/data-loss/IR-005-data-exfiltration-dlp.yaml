@@ -1,0 +1,244 @@
+id: IR-005
+name: Data Exfiltration via DLP Alert
+version: 1.0.0
+author: CostNimbus
+category: data-loss
+severity: [high, critical]
+mitre_attack:
+  - T1048       # Exfiltration Over Alternative Protocol
+  - T1048.003   # Exfiltration Over Unencrypted Non-C2 Protocol
+  - T1041       # Exfiltration Over C2 Channel
+  - T1567.002   # Exfiltration to Cloud Storage (OneDrive/Google Drive/Dropbox)
+  - T1052.001   # Exfiltration over USB
+  - T1530       # Data from Cloud Storage Object
+  - T1213       # Data from Information Repositories
+trigger:
+  - dlp_policy_violation
+  - casb_alert
+  - siem_large_data_transfer
+  - email_dlp_block
+  - endpoint_dlp_alert
+tags:
+  - data-loss
+  - exfiltration
+  - dlp
+  - pii
+  - sensitive-data
+  - casb
+  - compliance
+tools_required:
+  - dlp_platform
+  - casb
+  - siem
+  - edr
+  - proxy
+estimated_time: 60m
+
+integrations:
+  - platform: microsoft_purview
+    optional: false
+    notes: "Microsoft Purview DLP — email, SharePoint, OneDrive, Teams, endpoint"
+  - platform: forcepoint_dlp
+    optional: true
+    notes: "Alternative enterprise DLP — network and endpoint coverage"
+  - platform: netskope
+    optional: true
+    notes: "CASB and inline DLP for cloud app data movement"
+  - platform: crowdstrike_falcon
+    optional: true
+    notes: "Endpoint DLP and USB activity monitoring"
+  - platform: splunk
+    optional: false
+    notes: "SIEM correlation across DLP, proxy, and email logs"
+
+steps:
+  - id: step-1
+    name: Triage DLP alert and classify data sensitivity
+    type: investigation
+    tool: dlp_platform
+    description: >
+      Review the DLP alert details: policy triggered, data classification (PII, PCI, PHI,
+      IP, Confidential), file name, data volume, and detection confidence. Determine data
+      sensitivity level. Assess if this is a true positive (actual exfiltration attempt) or
+      a false positive (authorized transfer, miscategorized data). Avoid over-escalation on
+      low-confidence alerts.
+    automation_hint: >
+      Microsoft Purview: GET https://graph.microsoft.com/v1.0/security/alerts_v2?$filter=serviceSource eq 'microsoftPurview'
+      Forcepoint DLP: GET https://<dlp_server>/api/incidents/{incident_id}
+      Netskope: GET https://<tenant>.goskope.com/api/v1/alerts?token=<token>&type=dlp
+    outputs:
+      - alert_id
+      - data_classification
+      - confidence_score
+      - user_identity
+      - destination
+
+  - id: step-2
+    name: Identify the source user and data origin
+    type: investigation
+    tool: siem
+    description: >
+      Identify the user account involved: employee name, department, role, employment status
+      (especially: is this their notice period?). Identify where the data originated — SharePoint,
+      file server share, database, cloud storage. Establish whether the user has authorized
+      access to this data type and whether this transfer pattern is normal for their role.
+    automation_hint: >
+      Splunk SPL: index=dlp sourcetype=purview user="<user>" earliest=-7d
+      | stats count by action, destination_type | sort -count
+      Active Directory: Get-ADUser -Identity "<username>" -Properties Department,Manager,Title,whenCreated
+      HR system check: verify employment status and any pending departures
+    outputs:
+      - user_profile
+      - data_origin
+      - user_access_authorization
+      - normal_transfer_baseline
+
+  - id: step-3
+    name: Determine exfiltration destination and method
+    type: investigation
+    tool: proxy
+    description: >
+      Identify where data was sent: personal cloud storage (Dropbox, Google Drive, iCloud),
+      personal email (Gmail, Hotmail), USB device, airdrop, screenshot/camera, print,
+      or external web service. For cloud destinations, capture the account identifier if
+      possible. Check if HTTPS inspection is in place to see content.
+    automation_hint: >
+      Splunk SPL (proxy logs): index=proxy user="<user>" earliest=-24h
+      | stats sum(bytes_out) as total_bytes by dest_ip, dest_domain, url_category
+      | where total_bytes > 10000000 | sort -total_bytes
+      Netskope: GET https://<tenant>.goskope.com/api/v1/events?token=<token>&type=page
+      &query=user+eq+<user>+AND+appcategory+eq+"Cloud Storage"
+    outputs:
+      - exfiltration_channel
+      - destination_account
+      - data_volume_bytes
+      - transfer_timestamps
+
+  - id: step-4
+    name: Quantify the data exposure
+    type: investigation
+    tool: dlp_platform
+    description: >
+      Determine the scope of data exposure: number of records, file types, specific data
+      elements (SSNs, credit card numbers, health records, trade secrets). Pull file metadata
+      and content samples from DLP evidence storage. Assess regulatory impact (GDPR, HIPAA,
+      PCI-DSS, CCPA). This directly informs breach notification obligations.
+    automation_hint: >
+      Microsoft Purview Evidence: GET https://graph.microsoft.com/v1.0/security/cases/ediscoveryCases/{case_id}/searches/{search_id}/exportResult
+      Run data inventory query in Purview: SELECT * FROM data_inventory WHERE classification IN ('PII','PCI','PHI')
+      AND last_accessed_by = '<user>' AND last_accessed > '<incident_start>'
+    outputs:
+      - record_count
+      - data_elements_exposed
+      - regulatory_frameworks_triggered
+      - breach_notification_threshold
+
+  - id: step-5
+    name: Block the exfiltration channel immediately
+    type: action
+    tool: casb
+    description: >
+      Block the identified exfiltration channel: block personal cloud storage in CASB/proxy,
+      disable USB write access on the endpoint via EDR/MDM policy, block personal email in
+      DLP policy, revoke external sharing permissions in SharePoint/OneDrive. Apply blocks
+      urgently but confirm with manager/legal before if employment action may follow.
+    automation_hint: >
+      Netskope block app: POST https://<tenant>.goskope.com/api/v1/updatepolicy
+      Intune USB disable: PATCH https://graph.microsoft.com/v1.0/deviceManagement/deviceConfigurations/{id}
+      SharePoint: Set-SPOTenant -OneDriveForGuestsEnabled $false
+      CrowdStrike USB block: POST https://api.crowdstrike.com/policy/entities/device-control-policies/v1
+    outputs:
+      - channel_blocked
+      - block_scope
+
+  - id: step-6
+    name: Preserve evidence and establish chain of custody
+    type: action
+    tool: dlp_platform
+    description: >
+      Preserve all DLP evidence before any remediation that could alter it: capture screenshots
+      of the DLP alert, export the full audit log for the user's activity, preserve network
+      proxy logs, preserve EDR telemetry. Create a legal hold on the user's mailbox and
+      OneDrive/SharePoint content. Hash all evidence files for chain of custody.
+    automation_hint: >
+      Microsoft Purview: POST https://graph.microsoft.com/v1.0/compliance/ediscovery/cases/{case_id}/legalHolds
+      {"displayName": "IR-005 Legal Hold - <user>", "custodians": [{"id": "<user_id>"}]}
+      Export audit log: Export-AuditLogSearchResult -StartDate <date> -EndDate <date> -UserIds <user>
+    outputs:
+      - evidence_preserved
+      - legal_hold_applied
+      - chain_of_custody_hash
+
+  - id: step-7
+    name: Assess whether data retrieval is possible
+    type: investigation
+    description: >
+      Determine if the exfiltrated data can be recovered or access revoked: if sent to cloud
+      storage, can the destination account be suspended (if corporate)? Can the file be remotely
+      wiped (MDM)? If emailed externally, is there a recall capability? If physical device,
+      can device be retrieved? Attempt data retrieval only if it won't tip off the subject
+      prematurely (if insider threat investigation is ongoing).
+    outputs:
+      - data_recovery_feasibility
+      - recovery_method
+      - recovery_risk_assessment
+
+  - id: step-8
+    name: Escalate to HR, Legal, and CISO
+    type: escalation
+    description: >
+      Escalate immediately to: CISO (data breach decision-making authority), Legal (breach
+      notification obligations, employment law), HR (if insider threat — employment action).
+      Do not confront the employee until HR and Legal sign off on the approach. Provide them
+      with the evidence package, timeline, and regulatory exposure assessment.
+    outputs:
+      - ciso_notified
+      - legal_notified
+      - hr_notified
+      - escalation_timestamp
+
+  - id: step-9
+    name: Assess regulatory breach notification requirements
+    type: investigation
+    description: >
+      Work with Legal to determine notification obligations. GDPR: 72-hour notification to
+      supervisory authority if EU residents' data. HIPAA: 60-day notification to HHS + affected
+      individuals if PHI. CCPA: notification to CA Attorney General if >500 CA residents.
+      State breach notification laws vary — check all applicable jurisdictions.
+    outputs:
+      - notification_required
+      - notification_deadline
+      - notification_recipients
+      - regulatory_frameworks
+
+  - id: step-10
+    name: Implement enhanced monitoring on user account
+    type: action
+    tool: siem
+    description: >
+      If investigation is ongoing (employee not yet confronted), implement enhanced monitoring
+      without blocking access: increase logging verbosity, enable user behavior analytics (UBA)
+      alerts, alert on any additional sensitive data access, monitor all outbound communications.
+      Coordinate with Legal to ensure monitoring is lawful in your jurisdiction.
+    automation_hint: >
+      Splunk UBA: POST https://<splunk_uba>/rest/api/watchlist {"users": ["<user>"]}
+      Microsoft Sentinel: Add user to watchlist for high-priority monitoring
+      DLP: Increase policy sensitivity for this user — lower thresholds, log-only becomes block
+    outputs:
+      - enhanced_monitoring_active
+
+post_incident:
+  - Notify affected individuals and regulators per legal requirements and deadlines
+  - Conduct data inventory to understand what data is at risk and who has access
+  - Implement data minimization — reduce access to sensitive data on need-to-know basis
+  - Enable CASB for all cloud storage and collaboration tools to enforce DLP inline
+  - Review and tighten DLP policies — add recently exposed data types to detection rules
+  - Implement offboarding data security protocol — automatic access revocation on last day
+  - Conduct insider threat awareness training for all employees
+  - Commission annual data protection impact assessment (DPIA)
+  - File incident post-mortem with lessons learned and control improvements
+
+metrics:
+  avg_resolution_time: 120m
+  false_positive_rate: 30%
+  escalation_rate: 60%
