@@ -166,3 +166,9 @@ MIT License — free to use, modify, and distribute. See [LICENSE](LICENSE).
 [CostNimbus](https://costnimbus.io) builds tools that help security teams operate more efficiently. This playbook library is our contribution back to the SOC community.
 
 Questions? Ideas? Open an issue or reach out at **security@costnimbus.io**.
+
+
+## Related Projects
+
+- **[SOC Policy Library](https://github.com/cramir/soc-policy-library)** — Policy-as-Code (OPA/Rego) for cloud cost, security, and SOC2 compliance enforcement
+- **[Cost Nimbus](https://costnimbus.com)** — Cloud cost optimization guides, calculators, and tools
