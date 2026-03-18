@@ -1,0 +1,298 @@
+id: IR-015
+name: Non-Human Identity (NHI) Compromise — Service Accounts, API Keys, and CI/CD Tokens
+version: 1.0.0
+author: CostNimbus
+category: identity
+severity: [high, critical]
+mitre_attack:
+  - T1078.004   # Cloud Accounts (service account abuse)
+  - T1552.001   # Credentials In Files (hardcoded API keys)
+  - T1552.004   # Private Keys
+  - T1550.001   # Application Access Token (OAuth token theft)
+  - T1098.001   # Additional Cloud Credentials (new keys for persistence)
+  - T1059.009   # Cloud API (automated API abuse via stolen token)
+  - T1053.007   # Container Orchestration Job (CI/CD pipeline manipulation)
+  - T1195.002   # Compromise Software Supply Chain (CI/CD injection)
+trigger:
+  - service_account_off_hours_activity
+  - api_key_geographic_anomaly
+  - cicd_token_unauthorized_use
+  - service_account_permission_escalation
+  - secrets_manager_unusual_access
+  - siem_nhi_behavior_anomaly
+  - git_secret_exposure_alert
+  - github_actions_token_abuse
+tags:
+  - nhi
+  - service-account
+  - api-key
+  - oauth-token
+  - cicd
+  - github-actions
+  - secret-rotation
+  - machine-identity
+  - pipeline-security
+  - least-privilege
+tools_required:
+  - siem
+  - secrets_manager
+  - identity_provider
+  - cloud_console
+  - cicd_platform
+  - git_secret_scanner
+  - threat_intelligence_platform
+estimated_time: 55m
+
+integrations:
+  - platform: hashicorp_vault
+    optional: true
+    notes: "Dynamic secrets, lease revocation, and audit log for NHI credential management"
+  - platform: aws_iam
+    optional: true
+    notes: "Service account audit, access key management, and IAM roles for workloads"
+  - platform: github_advanced_security
+    optional: true
+    notes: "Secret scanning and push protection for detecting leaked NHI credentials in repos"
+  - platform: splunk
+    optional: true
+    notes: "NHI behavior analytics — baseline service account activity and detect anomalies"
+  - platform: cyberark_conjur
+    optional: true
+    notes: "Secrets management and rotation for CI/CD and application credentials"
+
+steps:
+  - id: step-1
+    name: Identify the compromised NHI and confirm the anomaly
+    type: investigation
+    tool: siem
+    description: >
+      Identify which non-human identity is compromised: service account, API key, OAuth token,
+      CI/CD pipeline token (GitHub Actions GITHUB_TOKEN, GitLab CI_JOB_TOKEN), or machine
+      certificate. Confirm the anomaly: off-hours API activity from a service account that
+      normally operates 9-5, geographically impossible source IP for an API key tied to a
+      specific cloud region, unusual resource access scope, or Git secret scanner alert on
+      a public/private repository. Determine if the NHI is still active.
+    automation_hint: >
+      AWS: aws cloudtrail lookup-events --lookup-attributes AttributeKey=AccessKeyId,AttributeValue=<key>
+      Azure: az monitor activity-log list --query "[?contains(caller,'ServicePrincipal')]" --start-time <date>
+      GCP: gcloud logging read 'protoPayload.authenticationInfo.serviceAccountKeyId="<key_id>"' --limit 100
+      GitHub Actions: GET https://api.github.com/repos/<owner>/<repo>/actions/runs?status=completed&per_page=30
+      GitGuardian: GET https://api.gitguardian.com/v1/incidents?status=triggered&severity=high
+    outputs:
+      - compromised_nhi_id
+      - nhi_type
+      - anomaly_confirmed
+      - activity_still_ongoing
+
+  - id: step-2
+    name: Immediately disable or revoke the compromised credential
+    type: action
+    tool: cloud_console
+    description: >
+      Disable the compromised NHI credential immediately. Do NOT delete — preserve for forensics.
+      For AWS IAM access keys: set status to Inactive. For Azure service principals: disable
+      the application or revoke the specific credential. For GCP service account keys: disable
+      the key. For GitHub personal access tokens or PATs: revoke via GitHub settings or admin API.
+      For Vault-managed secrets: revoke the specific lease. Act fast — every minute counts while
+      the attacker retains access.
+    automation_hint: >
+      AWS: aws iam update-access-key --access-key-id <key> --status Inactive --user-name <user>
+      Azure SP: az ad sp credential reset --id <sp_id> --credential-description "emergency-revoke"
+      GCP: gcloud iam service-accounts keys disable <key_id> --iam-account=<sa>@<project>.iam.gserviceaccount.com
+      GitHub PAT/Token: DELETE https://api.github.com/user/tokens/<token_id> (requires admin)
+      Vault: vault lease revoke <lease_id> or vault lease revoke -prefix <mount/role>
+      HashiCorp: vault token revoke <token>
+    outputs:
+      - credential_disabled
+      - revocation_timestamp
+      - forensic_copy_preserved
+
+  - id: step-3
+    name: Enumerate all API calls and actions made with the compromised identity
+    type: investigation
+    tool: siem
+    description: >
+      Build a complete timeline of all actions taken by the attacker using the compromised NHI.
+      Pull API call history from the relevant cloud/platform audit trail. Focus on: new credentials
+      created (persistence), permissions granted or roles assumed, data accessed or exported,
+      infrastructure changes (compute spawned, network changes), secrets read from vaults or
+      environment variables, and any cross-account or cross-service lateral movement.
+    automation_hint: >
+      AWS CloudTrail: aws cloudtrail lookup-events --lookup-attributes AttributeKey=AccessKeyId,AttributeValue=<key>
+      --start-time <start> --end-time <end> | jq '.Events[] | {time:.EventTime, event:.EventName, source:.SourceIPAddress}'
+      Azure: az monitor activity-log list --caller <sp_object_id> --start-time <start> --end-time <end>
+      GCP: gcloud logging read 'protoPayload.authenticationInfo.principalEmail="<sa_email>"' --limit 500
+      GitHub: GET https://api.github.com/orgs/<org>/audit-log?phrase=actor:<actor>&per_page=100
+    outputs:
+      - complete_api_call_timeline
+      - resources_accessed
+      - persistence_mechanisms_created
+      - data_exfiltration_assessment
+
+  - id: step-4
+    name: Detect and remediate secrets exposed in code repositories
+    type: investigation
+    tool: git_secret_scanner
+    description: >
+      If the compromise originated from a leaked secret in a code repository, scan all repos
+      for the exposed credential and any co-located secrets. Use trufflehog, GitGuardian, or
+      GitHub secret scanning to find all occurrences. Scan git history (not just HEAD) — secrets
+      committed and later deleted are still in git history. Check forks, public gists, Pastebin,
+      and developer workstations where the repo may have been cloned.
+    automation_hint: >
+      Trufflehog: trufflehog git https://github.com/<org>/<repo> --only-verified --json
+      Git history scan: git log -p --all | grep -E "(AKIA|sk-|ghp_|glpat-|xoxb-)"
+      GitHub secret scanning: gh secret list; gh api /repos/<owner>/<repo>/secret-scanning/alerts
+      GitGuardian API: GET https://api.gitguardian.com/v1/incidents?status=triggered
+      Remove from history: git filter-repo --path-glob '*.env' --invert-paths (then force-push)
+    outputs:
+      - exposure_source_identified
+      - all_occurrences_found
+      - git_history_cleaned
+
+  - id: step-5
+    name: Investigate CI/CD pipeline compromise and token abuse
+    type: investigation
+    tool: cicd_platform
+    description: >
+      If CI/CD pipeline tokens are involved, audit all pipeline executions during the attack
+      window. Look for: pipeline runs triggered from unexpected branches or forks, jobs that
+      accessed secrets not normally used by that pipeline, external network calls from build
+      jobs that are not expected, modified pipeline definition files (.github/workflows, .gitlab-ci.yml,
+      Jenkinsfile) with backdoors or secret exfiltration steps, and newly created pipeline
+      variables or environment-level secrets.
+    automation_hint: >
+      GitHub Actions: GET https://api.github.com/repos/<owner>/<repo>/actions/runs?event=workflow_dispatch&per_page=30
+      Check workflow file changes: git log --diff-filter=M -- .github/workflows/
+      GitLab: GET https://gitlab.com/api/v4/projects/<id>/jobs?scope=success&per_page=50
+      Jenkins: GET http://<jenkins>/job/<job>/api/json?tree=builds[number,result,timestamp,culprits]
+      Check for exfiltration: grep -r "curl.*\$SECRETS\|wget.*TOKEN\|base64.*SECRET" .github/workflows/
+    outputs:
+      - malicious_pipeline_runs
+      - secrets_accessed_in_ci
+      - pipeline_backdoors_found
+      - pipeline_definitions_modified
+
+  - id: step-6
+    name: Assess blast radius — identify all systems accessed by the NHI
+    type: investigation
+    tool: siem
+    description: >
+      Map the full blast radius of the compromise. Determine all systems, APIs, databases, and
+      cloud services the compromised NHI had permissions to access. Cross-reference against the
+      attacker's activity timeline to identify what was actually accessed vs. what was accessible.
+      For service accounts with broad permissions, assume worst-case and notify data owners.
+      Identify any privileged escalation paths the attacker could exploit from the compromised NHI.
+    automation_hint: >
+      AWS: aws iam simulate-principal-policy --policy-source-arn <role_arn> --action-names "*" (enumerate all allowed actions)
+      Azure: az role assignment list --assignee <sp_object_id> --all
+      GCP: gcloud projects get-iam-policy <project> --flatten="bindings[].members" --filter="bindings.members:<sa>"
+      Blast radius visualization: use IAM tools like Cloudsploit, Prowler, or PMapper
+    outputs:
+      - permissions_enumerated
+      - blast_radius_map
+      - sensitive_systems_accessed
+      - worst_case_scenario
+
+  - id: step-7
+    name: Rotate all compromised and co-located credentials
+    type: action
+    tool: secrets_manager
+    description: >
+      Rotate the compromised credential and all secrets that were co-located or accessible
+      to the compromised NHI. This includes: the primary compromised key/token, all other
+      keys in the same service account or application, database passwords the NHI had access
+      to, third-party API keys accessed via the NHI, and any secrets stored in the same vault
+      path or environment scope. For Vault, enable dynamic secrets to eliminate static
+      long-lived credentials.
+    automation_hint: >
+      AWS rotate all keys for user: aws iam list-access-keys --user-name <user> | jq '.AccessKeyMetadata[].AccessKeyId' | xargs -I{} aws iam update-access-key --access-key-id {} --status Inactive
+      Create new key: aws iam create-access-key --user-name <user>
+      Vault dynamic secrets: vault write database/config/<db> rotation_statements="ALTER USER ..."
+      GitHub repo secrets: gh secret set <SECRET_NAME> -b <new_value> --repo <owner>/<repo>
+      AWS Secrets Manager: aws secretsmanager rotate-secret --secret-id <secret>
+    outputs:
+      - primary_credential_rotated
+      - all_related_secrets_rotated
+      - dynamic_secrets_enabled
+
+  - id: step-8
+    name: Audit CI/CD pipeline security and remove backdoors
+    type: action
+    tool: cicd_platform
+    description: >
+      Remediate any CI/CD pipeline compromises found in step-5. Remove backdoored workflow files
+      and restore from last known-good commit. Audit all pipeline environment variables and
+      repository secrets — remove any that were not explicitly approved. Enable required reviews
+      for workflow changes, pin GitHub Actions to specific commit SHAs (not tags), and implement
+      OIDC-based token issuance for cloud access instead of long-lived service account keys.
+    automation_hint: >
+      Pin GitHub Actions: replace uses: actions/checkout@v3 with uses: actions/checkout@<sha>
+      Require reviews: GitHub Settings → Environments → required reviewers
+      Enable OIDC: Configure AWS: aws iam create-open-id-connect-provider (OIDC for GitHub Actions)
+      Review and prune secrets: gh secret list --repo <org>/<repo>
+      Remove backdoor workflow: git revert <commit_sha> && git push
+    outputs:
+      - pipeline_backdoors_removed
+      - workflow_files_audited
+      - oidc_token_issuance_enabled
+      - pipeline_secret_inventory_cleaned
+
+  - id: step-9
+    name: Implement NHI lifecycle management and monitoring
+    type: action
+    tool: identity_provider
+    description: >
+      Establish formal NHI lifecycle controls to prevent recurrence: inventory all service
+      accounts and API keys with owners and expiration dates, enforce maximum key age policies
+      (90 days), disable unused service accounts (>90 days without use), implement automated
+      rotation for all NHI credentials, and deploy continuous monitoring for NHI behavior
+      anomalies. Create a service account registry with documented purpose, owner, and access scope.
+    automation_hint: >
+      AWS access key age audit: aws iam generate-credential-report && aws iam get-credential-report | base64 -d | cut -d, -f1,4,9,11,14 | grep -v "N/A"
+      Unused keys: aws iam list-access-keys --user-name <user> | jq '.AccessKeyMetadata[] | select(.LastUsedDate==null or (.LastUsedDate|fromdateiso8601) < (now - 90*86400))'
+      GCP unused SAs: gcloud iam service-accounts list | while read sa; do gcloud projects get-iam-policy <project> --flatten bindings --filter "bindings.members:$sa"; done
+      Rotation: use AWS Secrets Manager rotation Lambda or Vault's automatic rotation
+    outputs:
+      - nhi_inventory_completed
+      - stale_credentials_disabled
+      - rotation_automation_enabled
+      - behavior_monitoring_active
+
+  - id: step-10
+    name: Report findings and implement least-privilege NHI access
+    type: notification
+    description: >
+      Report incident findings to security leadership, affected system owners, and the
+      DevSecOps team. Document the root cause, timeline, blast radius, and all remediation
+      steps. Initiate a least-privilege review for all NHIs involved — reduce permissions to
+      the minimum required for function. If regulated data was accessed (PII, PCI, PHI), engage
+      legal and compliance for breach notification assessment. File lessons learned in the runbook
+      for future NHI compromise scenarios.
+    automation_hint: >
+      Least privilege review tools: IAM Access Analyzer (AWS), Azure AD Access Reviews, GCP IAM Recommender
+      AWS IAM Recommender: aws iam generate-service-last-accessed-details --arn <arn>
+      Access review: GET https://graph.microsoft.com/v1.0/identityGovernance/accessReviews/definitions
+      PagerDuty: pd incident create --title "IR-015 NHI Compromise: <nhi_name>"
+      JIRA: Create security incident ticket with compliance label if regulated data accessed
+    outputs:
+      - incident_report_filed
+      - least_privilege_remediation_initiated
+      - breach_notification_assessed
+      - lessons_learned_documented
+
+post_incident:
+  - Implement a complete NHI inventory — every service account, API key, and OAuth token must have a documented owner and purpose
+  - "Enforce maximum credential lifetime: 90 days for API keys, 24 hours for CI/CD tokens, instant rotation via OIDC where possible"
+  - Migrate from long-lived static credentials to dynamic short-lived credentials (OIDC for CI/CD, IRSA for EKS, Workload Identity for GKE)
+  - Deploy secrets scanning with push protection in all code repositories — block credential commits before they land
+  - Enable automated credential rotation via HashiCorp Vault, AWS Secrets Manager, or equivalent platform
+  - Conduct quarterly NHI access reviews — revoke service accounts unused for >90 days
+  - Implement anomaly detection for NHI behavior — baseline normal activity and alert on deviations
+  - Require peer review and security approval for all CI/CD pipeline changes that modify secrets access or add new permissions
+  - Enforce code signing for pipeline artifacts and pin all third-party CI/CD actions to verified commit SHAs
+
+metrics:
+  avg_resolution_time: 85m
+  false_positive_rate: 8%
+  escalation_rate: 40%

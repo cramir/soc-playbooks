@@ -1,7 +1,7 @@
 # SOC Playbook Automation Library
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Playbooks](https://img.shields.io/badge/playbooks-10-blue.svg)](#playbook-index)
+[![Playbooks](https://img.shields.io/badge/playbooks-15-blue.svg)](#playbook-index)
 [![Schema Validated](https://img.shields.io/badge/schema-validated-brightgreen.svg)](schema/playbook-schema.yaml)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
@@ -37,6 +37,11 @@ This library provides battle-tested incident response playbooks in a consistent,
 | [IR-008](playbooks/cloud/IR-008-cloud-resource-hijacking.yaml) | Cloud Resource Hijacking | cloud | high, critical | 35m |
 | [IR-009](playbooks/supply-chain/IR-009-supply-chain-compromise.yaml) | Supply Chain Compromise | supply-chain | critical | 120m |
 | [IR-010](playbooks/endpoint/IR-010-privilege-escalation-detection.yaml) | Privilege Escalation Detection | endpoint | high, critical | 30m |
+| [IR-011](playbooks/ai-ml/IR-011-ai-ml-model-abuse.yaml) | AI/ML Model Abuse and Training Data Poisoning | cloud | medium, high, critical | 60m |
+| [IR-012](playbooks/api-security/IR-012-api-abuse-credential-stuffing.yaml) | API Abuse and Credential Stuffing Attack Response | network | medium, high, critical | 45m |
+| [IR-013](playbooks/identity/IR-013-saas-account-compromise.yaml) | SaaS Account Compromise (M365, Google Workspace, Slack) | identity | high, critical | 50m |
+| [IR-014](playbooks/cloud/IR-014-container-kubernetes-incident.yaml) | Container and Kubernetes Security Incident Response | cloud | high, critical | 60m |
+| [IR-015](playbooks/identity/IR-015-nhi-compromise.yaml) | Non-Human Identity (NHI) Compromise | identity | high, critical | 55m |
 
 ---
 

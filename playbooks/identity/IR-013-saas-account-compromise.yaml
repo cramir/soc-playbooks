@@ -1,0 +1,294 @@
+id: IR-013
+name: SaaS Account Compromise (M365, Google Workspace, Slack)
+version: 1.0.0
+author: CostNimbus
+category: identity
+severity: [high, critical]
+mitre_attack:
+  - T1078.004   # Cloud Accounts (Valid Accounts)
+  - T1556.006   # Multi-Factor Authentication (MFA bypass)
+  - T1114.002   # Email Collection — Remote Email Collection
+  - T1114.003   # Email Forwarding Rule
+  - T1550.001   # Application Access Token (OAuth token theft)
+  - T1098.003   # Additional Cloud Roles
+  - T1136.003   # Create Cloud Account (persistence)
+  - T1530       # Data from Cloud Storage Object
+trigger:
+  - impossible_travel_alert
+  - new_mfa_device_registered
+  - suspicious_mail_forwarding_rule
+  - oauth_app_admin_consent
+  - mass_download_sharepoint
+  - saas_risky_signin_alert
+  - identity_protection_alert
+  - user_reported_account_takeover
+tags:
+  - saas
+  - microsoft-365
+  - google-workspace
+  - slack
+  - account-takeover
+  - oauth
+  - mfa-bypass
+  - email-forwarding
+  - session-hijacking
+tools_required:
+  - microsoft_365_defender
+  - google_workspace_admin
+  - identity_provider
+  - siem
+  - casb
+  - threat_intelligence_platform
+estimated_time: 50m
+
+integrations:
+  - platform: microsoft_365_defender
+    optional: false
+    notes: "Primary detection for M365 — Unified audit log, Identity Protection, Defender for Cloud Apps"
+  - platform: google_workspace_admin
+    optional: true
+    notes: "Admin SDK audit logs and security center for Workspace investigations"
+  - platform: okta
+    optional: true
+    notes: "Identity threat protection, session management, and risk-based authentication"
+  - platform: microsoft_entra_id
+    optional: true
+    notes: "Azure AD Conditional Access, sign-in logs, and Identity Protection risk signals"
+  - platform: microsoft_defender_for_cloud_apps
+    optional: true
+    notes: "CASB for OAuth app governance, anomalous activity detection, and session controls"
+
+steps:
+  - id: step-1
+    name: Confirm account compromise and assess initial scope
+    type: investigation
+    tool: microsoft_365_defender
+    description: >
+      Review the triggering alert and confirm account compromise indicators: impossible travel
+      (login from two distant IPs within an unrealistic timeframe), login from an atypical
+      country or high-risk IP, new MFA device registration not initiated by the user, or
+      user-reported unauthorized access. Identify all affected accounts, the compromise timeline,
+      and the attacker's source IPs. Determine if the incident is isolated to one user or
+      is part of a broader campaign targeting multiple accounts.
+    automation_hint: >
+      M365: Search-UnifiedAuditLog -UserIds <user> -Operations UserLoggedIn,UserLoginFailed -StartDate <date>
+      Azure AD sign-in logs: GET https://graph.microsoft.com/v1.0/auditLogs/signIns?$filter=userPrincipalName eq '<user>'
+      Google Workspace: GET https://admin.googleapis.com/admin/reports/v1/activity/users/<user>/applications/login
+      PowerShell: Get-MgAuditLogSignIn -Filter "userPrincipalName eq '<user>'" | Select-Object CreatedDateTime, IpAddress, Location, RiskLevelDuringSignIn
+    outputs:
+      - confirmed_compromised_accounts
+      - attacker_source_ips
+      - compromise_start_time
+      - attack_campaign_scope
+
+  - id: step-2
+    name: Revoke all active sessions immediately
+    type: action
+    tool: identity_provider
+    description: >
+      Terminate all active sessions for the compromised account across all SaaS platforms.
+      This invalidates existing access tokens, refresh tokens, and session cookies, forcing
+      the attacker out immediately. For M365, revoke sign-in sessions and invalidate all
+      refresh tokens. For Google Workspace, sign out all devices. For Slack, revoke all
+      active sessions. Do not wait for password reset before revoking sessions — the attacker
+      may be monitoring the session actively.
+    automation_hint: >
+      M365 PowerShell: Revoke-MgUserSignInSession -UserId <user_id>
+      Or: Invoke-MgInvalidateAllRefreshTokensByUserId (Graph API)
+      Microsoft Graph: POST https://graph.microsoft.com/v1.0/users/<id>/revokeSignInSessions
+      Google Workspace: POST https://admin.googleapis.com/admin/directory/v1/users/<user>/signOut
+      Slack: POST https://slack.com/api/admin.users.session.resetBulk (Slack Enterprise Grid)
+    outputs:
+      - sessions_revoked
+      - refresh_tokens_invalidated
+      - revocation_timestamp
+
+  - id: step-3
+    name: Force password reset and re-enroll MFA
+    type: action
+    tool: identity_provider
+    description: >
+      Force a password reset for all compromised accounts. Require the user to create a strong
+      password not previously used. Require MFA re-enrollment from a trusted device — invalidate
+      any recently registered MFA devices that were not approved by the user. If phishing-resistant
+      MFA (FIDO2/passkeys) is available, require upgrade from SMS/TOTP. Notify the user via
+      an out-of-band channel (phone call, Slack DM from IT) with instructions.
+    automation_hint: >
+      M365: Set-MsolUserPassword -UserPrincipalName <user> -ForceChangePassword $true
+      Disable new MFA methods: Set-MgUserAuthenticationPhoneMethod (review and delete attacker-added methods)
+      Microsoft Graph: DELETE https://graph.microsoft.com/v1.0/users/<id>/authentication/phoneMethods/<method_id>
+      Azure AD: Remove-MgUserAuthenticationSoftwareOathMethod -UserId <id> -SoftwareOathAuthenticationMethodId <method_id>
+      Google: admin.directory.users.update — changePasswordAtNextLogin: true
+    outputs:
+      - password_reset_forced
+      - attacker_mfa_devices_removed
+      - mfa_re_enrollment_required
+
+  - id: step-4
+    name: Audit and remove malicious mail forwarding rules and inbox rules
+    type: investigation
+    tool: microsoft_365_defender
+    description: >
+      Attackers commonly establish persistence by creating inbox rules to forward emails to
+      external addresses, delete security alerts, or move sensitive emails to obscure folders.
+      Review all inbox rules and mail forwarding settings for the compromised account.
+      Check: external forwarding rules, rules that delete or move security alert emails,
+      rules triggered on keywords (invoice, payment, password reset), and tenant-level
+      external email forwarding policies.
+    automation_hint: >
+      M365 Exchange: Get-InboxRule -Mailbox <user> | Select Name, Description, ForwardTo, ForwardAsAttachmentTo, RedirectTo, DeleteMessage
+      Remove malicious rule: Remove-InboxRule -Identity <rule_id> -Mailbox <user>
+      Check mail transport rules: Get-TransportRule | Where-Object {$_.BlindCopyTo -ne $null}
+      Google Workspace: GET https://gmail.googleapis.com/gmail/v1/users/<user>/settings/forwardingAddresses
+      Microsoft Graph: GET https://graph.microsoft.com/v1.0/users/<user>/mailFolders/inbox/messageRules
+    outputs:
+      - malicious_rules_found
+      - forwarding_destinations
+      - rules_removed
+
+  - id: step-5
+    name: Review and revoke unauthorized OAuth application grants
+    type: investigation
+    tool: casb
+    description: >
+      Attackers may grant OAuth consent to malicious third-party applications to maintain
+      persistent access even after password reset. Review all OAuth applications authorized
+      by the compromised account. Flag apps with broad permissions (mail.read, files.read.all,
+      contacts.read), unfamiliar app publishers, recently consented apps, and apps not in the
+      approved enterprise application catalog. Revoke all suspicious OAuth grants immediately.
+    automation_hint: >
+      M365: Get-MgUserOAuth2PermissionGrant -UserId <user_id> | Select ClientId, Scope, ConsentType
+      Revoke: Remove-MgOAuth2PermissionGrant -OAuth2PermissionGrantId <grant_id>
+      PowerShell: Get-AzureADUserOAuth2PermissionGrant -ObjectId <user_id>
+      Microsoft Graph: DELETE https://graph.microsoft.com/v1.0/oauth2PermissionGrants/<id>
+      Google Workspace Admin: POST https://admin.googleapis.com/admin/datatransfer/v1/transfers
+      Revoke all for user: Get-AzureADServicePrincipal | Get-AzureADServicePrincipalOAuth2PermissionGrant
+    outputs:
+      - oauth_apps_audited
+      - malicious_oauth_grants_revoked
+      - approved_app_list_reviewed
+
+  - id: step-6
+    name: Investigate data access and exfiltration during attack window
+    type: investigation
+    tool: casb
+    description: >
+      Audit all data access activity during the attacker-controlled session: files downloaded
+      from SharePoint/OneDrive/Google Drive, emails read or forwarded, calendar events viewed,
+      Teams/Slack messages accessed, and any data shared externally. Look for mass download
+      events, external sharing link creation, bulk email reads, and calendar data access
+      (often used for whaling and BEC). Assess the sensitivity of data accessed.
+    automation_hint: >
+      M365 Unified Audit Log (PowerShell):
+      Search-UnifiedAuditLog -UserIds <user> -Operations FileDownloaded,FileCopied,FileAccessedExtended,SendAs
+      -StartDate <start> -EndDate <end> | Export-Csv audit_report.csv
+      SharePoint activity: Get-SPOSite | Get-SPOActivityReport
+      Google Workspace: Reports API — drive activity, gmail activity during attack window
+      Defender for Cloud Apps: Investigate user activity timeline in MCAS portal
+    outputs:
+      - files_downloaded
+      - emails_exfiltrated
+      - external_shares_created
+      - data_sensitivity_assessment
+
+  - id: step-7
+    name: Check for attacker persistence mechanisms
+    type: investigation
+    tool: microsoft_365_defender
+    description: >
+      Attackers often establish multiple persistence mechanisms. Check for: new app registrations
+      in Azure AD with permissions to the compromised tenant, new service principals or managed
+      identities, new user accounts created by the attacker, admin role assignments made during
+      the attack window, modifications to Conditional Access policies, new mail connectors or
+      transport rules, and new webhooks or API subscriptions in Slack, Teams, or other SaaS.
+    automation_hint: >
+      New Azure AD apps: Get-MgApplication -Filter "createdDateTime ge <attack_date>"
+      New users: Get-MgUser -Filter "createdDateTime ge <attack_date>"
+      Admin roles: Get-MgRoleManagementDirectoryRoleAssignment | Where-Object {$_.CreatedDateTime -gt <date>}
+      Slack app installations: GET https://slack.com/api/apps.connections.list (Enterprise Grid)
+      New M365 mail connectors: Get-InboundConnector; Get-OutboundConnector (check CreatedDate)
+    outputs:
+      - persistence_mechanisms_found
+      - new_accounts_created
+      - privilege_escalation_detected
+      - persistence_removed
+
+  - id: step-8
+    name: Implement conditional access and session controls
+    type: action
+    tool: identity_provider
+    description: >
+      Strengthen access controls to prevent recurrence: enable Conditional Access policies
+      requiring compliant/hybrid-joined devices for SaaS access, block legacy authentication
+      protocols (SMTP AUTH, POP3, IMAP — common bypass vectors), enable continuous access
+      evaluation (CAE) for real-time token revocation, require phishing-resistant MFA for
+      all privileged accounts, and deploy Microsoft Defender for Cloud Apps session controls
+      or equivalent CASB proxy for sensitive SaaS applications.
+    automation_hint: >
+      Azure AD Conditional Access: New-MgIdentityConditionalAccessPolicy (block legacy auth)
+      Block legacy auth: clientAppTypes = ['exchangeActiveSync', 'other'] — grant access block
+      CAE: Enabled by default in Azure AD — verify with: Get-MgPolicyContinuousAccessEvaluation
+      CASB session control: Configure Defender for Cloud Apps app connector and conditional access app control
+    outputs:
+      - legacy_auth_blocked
+      - cae_enabled
+      - session_controls_deployed
+      - phishing_resistant_mfa_enforced
+
+  - id: step-9
+    name: Notify user, management, and compliance teams
+    type: notification
+    description: >
+      Notify the compromised user directly (out-of-band channel) with: confirmation of compromise,
+      actions taken, and guidance on securing personal accounts that may share the same password.
+      Brief the user's manager and HR if sensitive business communications were accessed.
+      Engage legal and compliance if regulated data (HIPAA, GDPR, PCI) was accessed — potential
+      breach notification obligations within 72 hours (GDPR) or 60 days (HIPAA) may apply.
+      File incident report in ticketing system.
+    automation_hint: >
+      Out-of-band notification: phone call, SMS via Twilio, or Slack DM from IT account
+      GDPR breach register: document within 72 hours if personal data involved
+      PagerDuty: pd incident create --title "IR-013 SaaS Account Compromise: <user>"
+      JIRA: Create Incident ticket with Privacy/Legal label if regulated data accessed
+    outputs:
+      - user_notified
+      - management_briefed
+      - legal_compliance_assessed
+      - breach_notification_filed
+
+  - id: step-10
+    name: Determine initial access vector and close the gap
+    type: investigation
+    description: >
+      Investigate how the attacker obtained valid credentials. Common vectors: phishing email
+      with AiTM (adversary-in-the-middle) proxy stealing session cookies, credential bought from
+      infostealer marketplace, password reuse from prior data breach, SIM swapping to bypass
+      SMS MFA, or insider threat. Review email headers for phishing attempts received prior to
+      the compromise, check for infostealer infection on the user's endpoint (Redline, Raccoon,
+      Vidar), and scan the dark web for the user's credentials.
+    automation_hint: >
+      Phishing search: Search-UnifiedAuditLog -Operations MailItemsAccessed,UserLoggedIn -prior to compromise time
+      Infostealer hunting: check endpoint EDR for credential-stealing malware indicators
+      HaveIBeenPwned: GET https://haveibeenpwned.com/api/v3/breachedaccount/<email>
+      AiTM phishing IOCs: check email headers for Evilginx2, Modlishka, Muraena relay patterns
+      Dark web monitoring: Flare, SpyCloud, or similar platforms for credential exposure
+    outputs:
+      - initial_access_vector
+      - phishing_campaign_identified
+      - endpoint_clean_or_compromised
+
+post_incident:
+  - Enforce phishing-resistant MFA (FIDO2/passkeys) for all accounts — eliminate SMS and TOTP for privileged users
+  - Block legacy authentication protocols globally across M365 and Google Workspace tenants
+  - Implement CASB session controls for all sanctioned SaaS applications
+  - Enable tenant-wide external email forwarding block and audit forwarding rules quarterly
+  - Deploy Microsoft Entra Identity Protection or equivalent risk-based Conditional Access policies
+  - Conduct phishing simulation campaign targeting all employees, with focus on AiTM scenarios
+  - Integrate dark web credential monitoring to proactively detect exposed credentials
+  - Establish OAuth application allowlisting — block unapproved app consent at tenant level
+  - Review SaaS application catalog and remove unused or unapproved applications
+
+metrics:
+  avg_resolution_time: 80m
+  false_positive_rate: 10%
+  escalation_rate: 50%

@@ -1,0 +1,304 @@
+id: IR-014
+name: Container and Kubernetes Security Incident Response
+version: 1.0.0
+author: CostNimbus
+category: cloud
+severity: [high, critical]
+mitre_attack:
+  - T1610       # Deploy Container
+  - T1613       # Container and Resource Discovery
+  - T1611       # Escape to Host (container escape)
+  - T1496       # Resource Hijacking (cryptomining)
+  - T1552.007   # Container API (credentials from container API)
+  - T1021.004   # Remote Services — SSH (pod-to-pod lateral movement)
+  - T1543       # Create or Modify System Process (DaemonSet backdoor)
+  - T1078.001   # Default Accounts (default ServiceAccount token abuse)
+trigger:
+  - falco_container_escape_alert
+  - kubernetes_audit_privileged_pod
+  - resource_spike_cpu_memory
+  - unexpected_network_policy_change
+  - kubernetes_rbac_anomaly
+  - container_scanning_critical_finding
+  - siem_k8s_audit_anomaly
+  - cryptominer_detected
+tags:
+  - kubernetes
+  - container
+  - k8s
+  - container-escape
+  - cryptomining
+  - lateral-movement
+  - privileged-pod
+  - rbac-abuse
+  - pod-security
+tools_required:
+  - kubernetes_cli
+  - container_runtime
+  - siem
+  - cloud_console
+  - falco
+  - trivy
+  - threat_intelligence_platform
+estimated_time: 60m
+
+integrations:
+  - platform: falco
+    optional: false
+    notes: "Runtime security for container escape, privilege escalation, and anomalous syscall detection"
+  - platform: aws_eks
+    optional: true
+    notes: "EKS control plane audit logs, CloudTrail for Kubernetes API server events"
+  - platform: gke_security_command_center
+    optional: true
+    notes: "GKE threat detection and container threat analysis"
+  - platform: datadog
+    optional: true
+    notes: "Container performance monitoring for resource hijacking and crypto mining detection"
+  - platform: trivy
+    optional: true
+    notes: "Container image vulnerability scanning and SBOM analysis"
+
+steps:
+  - id: step-1
+    name: Identify the affected pods, nodes, and namespaces
+    type: investigation
+    tool: kubernetes_cli
+    description: >
+      Identify the scope of the incident: which pods, namespaces, and nodes are affected.
+      Review the triggering alert for details — Falco rule name, pod name, namespace, node,
+      and container image. For cryptomining: identify pods with abnormal CPU/memory consumption.
+      For container escapes: identify the pod that triggered the syscall anomaly and the
+      node it runs on. For RBAC abuse: identify the ServiceAccount and the API calls made.
+      Determine if the incident is limited to a single pod or has spread across the cluster.
+    automation_hint: >
+      kubectl get pods --all-namespaces -o wide | grep -v Running
+      kubectl top pods --all-namespaces | sort --reverse --key 3 --numeric | head -20
+      kubectl get events --all-namespaces --sort-by='.lastTimestamp' | tail -50
+      kubectl describe pod <pod-name> -n <namespace>
+      EKS audit logs: aws cloudwatch filter-log-events --log-group-name /aws/eks/<cluster>/cluster --filter-pattern '{ $.verb = "create" && $.objectRef.resource = "pods" }'
+    outputs:
+      - affected_pods
+      - affected_nodes
+      - affected_namespaces
+      - container_images_involved
+
+  - id: step-2
+    name: Detect container escape or privileged container abuse
+    type: investigation
+    tool: falco
+    description: >
+      Investigate container escape indicators: privileged containers mounting the host filesystem
+      (hostPath volumes), pods with hostPID or hostNetwork enabled, unusual mount points inside
+      containers, Falco alerts for container_escape or shell_in_container rules, unexpected
+      nsenter or chroot syscalls, and processes running inside containers that shouldn't be
+      (kubectl, crictl, docker). Check if the attacker has accessed the underlying node OS.
+    automation_hint: >
+      kubectl get pods --all-namespaces -o json | jq '.items[] | select(.spec.hostPID==true or .spec.hostNetwork==true or .spec.containers[].securityContext.privileged==true) | {name: .metadata.name, ns: .metadata.namespace}'
+      Falco: journalctl -u falco | grep "Container Escape\|Privilege Escalation\|shell in container"
+      Check host mounts: kubectl get pod <pod> -o json | jq '.spec.volumes[] | select(.hostPath)'
+      Node access: kubectl exec -it <pod> -- chroot /host /bin/bash (if /host is mounted)
+    outputs:
+      - container_escape_confirmed
+      - privileged_containers_found
+      - host_access_achieved
+      - affected_nodes_compromised
+
+  - id: step-3
+    name: Identify cryptomining or resource hijacking workloads
+    type: investigation
+    tool: siem
+    description: >
+      If resource hijacking is suspected, identify cryptomining containers: look for pods with
+      sustained >90% CPU usage, known cryptominer process names (xmrig, kswapd0, kdevtmpfsi,
+      cryptonight), outbound connections to mining pool domains (pool.minexmr.com, xmrig.com),
+      and container images not from approved registries. Check for recently deployed DaemonSets
+      (to ensure persistence across all nodes). Correlate with cloud billing anomalies.
+    automation_hint: >
+      kubectl top pods --all-namespaces --sort-by=cpu | head -20
+      Process check: kubectl exec -it <pod> -- ps aux | grep -E "(xmrig|minerd|cryptonight|kswapd)"
+      Network: kubectl exec -it <pod> -- ss -tnp | grep -E "(3333|4444|5555|7777|14444)"  # common mining ports
+      Image audit: kubectl get pods --all-namespaces -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[*].image}{"\n"}{end}' | grep -v <approved_registry>
+    outputs:
+      - cryptominer_pods_identified
+      - mining_pool_connections
+      - unauthorized_images
+      - resource_cost_impact
+
+  - id: step-4
+    name: Isolate affected pods with network policy
+    type: action
+    tool: kubernetes_cli
+    description: >
+      Apply emergency network policy to isolate affected pods and prevent lateral movement
+      or C2 communication. Create a deny-all NetworkPolicy in the affected namespace to block
+      all ingress and egress traffic. For container escape scenarios where the node may be
+      compromised, cordon the node to prevent new pod scheduling. If Calico or Cilium is
+      used, apply a GlobalNetworkPolicy to quarantine at the node level.
+    automation_hint: >
+      Apply deny-all network policy:
+      kubectl apply -f - <<EOF
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: deny-all-quarantine
+        namespace: <compromised_namespace>
+      spec:
+        podSelector: {}
+        policyTypes: [Ingress, Egress]
+      EOF
+      Cordon node: kubectl cordon <node-name>
+      Label pod for quarantine: kubectl label pod <pod> quarantine=true -n <namespace>
+    outputs:
+      - network_policies_applied
+      - nodes_cordoned
+      - lateral_movement_blocked
+
+  - id: step-5
+    name: Kill malicious pods and delete unauthorized workloads
+    type: action
+    tool: kubernetes_cli
+    description: >
+      Terminate malicious pods and delete any unauthorized workloads created by the attacker.
+      Before deletion, capture the pod's runtime state for forensics: exec into the pod to
+      collect process list, network connections, and filesystem artifacts. If possible, snapshot
+      the container filesystem. Delete cryptomining pods, attacker-created Deployments,
+      DaemonSets, Jobs, and CronJobs. Remove unauthorized container images from the node's
+      local cache to prevent re-execution.
+    automation_hint: >
+      Collect forensics first: kubectl exec <pod> -n <ns> -- /bin/sh -c "ps aux; ss -tnp; cat /etc/hosts" > pod_forensics.txt
+      Snapshot filesystem: kubectl cp <pod>:/tmp /local/evidence/ -n <namespace>
+      Kill pod: kubectl delete pod <pod-name> -n <namespace> --grace-period=0 --force
+      Delete deployment: kubectl delete deployment <name> -n <namespace>
+      Remove from all nodes: kubectl get nodes -o name | xargs -I{} kubectl debug -it {} --image=alpine -- crictl rmi <malicious_image>
+    outputs:
+      - forensics_collected
+      - malicious_pods_deleted
+      - unauthorized_workloads_removed
+
+  - id: step-6
+    name: Audit RBAC and ServiceAccount permissions
+    type: investigation
+    tool: kubernetes_cli
+    description: >
+      Investigate RBAC abuse: identify which ServiceAccount the compromised pod used, what
+      ClusterRoles or Roles it was bound to, and what API server calls were made using that
+      token. Check the Kubernetes audit log for sensitive API calls: listing secrets, creating
+      pods, exec into other pods, or accessing the kubelet API. Look for newly created
+      ServiceAccounts, RoleBindings, or ClusterRoleBindings created during the attack window.
+    automation_hint: >
+      Check SA permissions: kubectl auth can-i --list --as system:serviceaccount:<namespace>:<sa-name>
+      List bindings: kubectl get clusterrolebindings -o json | jq '.items[] | select(.subjects[]?.name=="<sa-name>")'
+      Audit log (EKS): filter for verb=exec, list, get -- resource=secrets,pods in cloudwatch
+      New RBAC objects: kubectl get clusterrolebindings --sort-by=.metadata.creationTimestamp | tail -20
+      Revoke SA token: kubectl delete secret <sa-token-secret> -n <namespace>
+    outputs:
+      - serviceaccount_permissions
+      - api_calls_made_by_attacker
+      - rbac_changes_detected
+      - excessive_permissions_found
+
+  - id: step-7
+    name: Investigate lateral movement to other pods or cloud services
+    type: investigation
+    tool: siem
+    description: >
+      Determine if the attacker moved laterally from the compromised pod. Check for: API calls
+      to the Kubernetes API server from unusual pods, kubectl exec sessions initiated against
+      other pods, cloud metadata service calls (IMDS at 169.254.169.254) to steal cloud
+      credentials, attempts to access secrets in other namespaces, and connections to other
+      pods on non-standard ports. For cloud-hosted clusters, check CloudTrail/Stackdriver
+      for subsequent cloud API calls from the node's IAM role.
+    automation_hint: >
+      Node IAM role abuse (EKS): aws cloudtrail lookup-events --lookup-attributes AttributeKey=SourceIPAddress,AttributeValue=<node_ip>
+      IMDS call detection: Falco rule: k8s_metadata_service_access or check container network logs for 169.254.169.254
+      Pod-to-pod connections: kubectl logs -n calico-system <calico-pod> | grep <compromised_pod_ip>
+      Secrets accessed: kubernetes audit log — filter verb=get resource=secrets namespace!=<expected>
+    outputs:
+      - lateral_movement_confirmed
+      - cloud_credentials_stolen
+      - other_pods_compromised
+      - blast_radius_assessment
+
+  - id: step-8
+    name: Rotate secrets, tokens, and cloud credentials
+    type: action
+    tool: cloud_console
+    description: >
+      Rotate all credentials that may have been accessed by the attacker: Kubernetes Secrets
+      in the compromised namespace (DB passwords, API keys, TLS certs), ServiceAccount tokens,
+      cloud IAM credentials associated with the node's instance profile or workload identity,
+      and any secrets stored in a secrets manager (Vault, AWS Secrets Manager) that the
+      compromised workload had access to. Rotate the Kubernetes API server certificate if
+      a cluster-admin token was exposed.
+    automation_hint: >
+      List secrets in namespace: kubectl get secrets -n <namespace>
+      Recreate SA token: kubectl delete serviceaccount <sa> -n <namespace>; kubectl create serviceaccount <sa> -n <namespace>
+      AWS node role key rotation: aws iam create-access-key (if using static keys — prefer IRSA instead)
+      Vault: vault lease revoke -prefix auth/kubernetes/<role>
+      AWS Secrets Manager: aws secretsmanager rotate-secret --secret-id <secret>
+    outputs:
+      - secrets_rotated
+      - sa_tokens_regenerated
+      - cloud_credentials_rotated
+
+  - id: step-9
+    name: Re-image or rebuild compromised nodes
+    type: action
+    tool: cloud_console
+    description: >
+      For confirmed container escapes where the host OS was accessed, the node is no longer
+      trustworthy and must be drained and terminated. Drain the node to reschedule workloads,
+      then terminate and replace it with a fresh instance from a known-good AMI/image.
+      For managed Kubernetes (EKS, GKE, AKS), trigger a node pool replacement or rolling
+      upgrade. Do not attempt to clean and reuse a compromised node.
+    automation_hint: >
+      Drain node: kubectl drain <node> --ignore-daemonsets --delete-emptydir-data
+      Delete node from cluster: kubectl delete node <node>
+      EKS: aws eks update-nodegroup-config --cluster-name <cluster> --nodegroup-name <ng> --scaling-config desiredSize=<n+1>
+      Then terminate compromised instance: aws ec2 terminate-instances --instance-ids <node_instance_id>
+      GKE: gcloud container clusters upgrade <cluster> --node-pool <pool>
+    outputs:
+      - nodes_drained
+      - nodes_terminated
+      - clean_nodes_provisioned
+
+  - id: step-10
+    name: Apply pod security policies and admission controls
+    type: action
+    tool: kubernetes_cli
+    description: >
+      Harden the cluster post-incident: enforce Pod Security Standards (Restricted or Baseline)
+      across all namespaces, implement OPA Gatekeeper or Kyverno policies to reject privileged
+      containers, hostPath mounts, and default ServiceAccount auto-mounting. Ensure all container
+      images are from approved registries with verified signatures (Cosign/Notary). Deploy
+      runtime security with Falco rules for ongoing detection. Review and tighten all RBAC
+      to least privilege.
+    automation_hint: >
+      Apply Pod Security Standard: kubectl label namespace <ns> pod-security.kubernetes.io/enforce=restricted
+      Kyverno policy — block privileged: kubectl apply -f https://kyverno.io/policies/pod-security/restricted/
+      Disable SA automount: kubectl patch serviceaccount default -p '{"automountServiceAccountToken": false}' -n <ns>
+      Image signing: cosign verify --key <pub-key> <image>
+      Falco rules: edit /etc/falco/falco_rules.yaml — enable container_escape, write_below_etc, etc.
+    outputs:
+      - pod_security_standards_enforced
+      - admission_controls_deployed
+      - rbac_hardened
+      - runtime_monitoring_enhanced
+
+post_incident:
+  - Enforce Pod Security Standards (Restricted) globally — no privileged containers outside kube-system
+  - Implement mandatory image signing and verify signatures at admission time (Cosign + Kyverno)
+  - Deploy Falco or equivalent runtime security with custom rules for your environment
+  - Audit all ClusterRoleBindings — remove cluster-admin grants from service accounts and user workloads
+  - Disable ServiceAccount token automounting by default — opt-in only for pods that need it
+  - Implement network segmentation with NetworkPolicy — default deny-all with explicit allow rules
+  - Enable Kubernetes audit logging to SIEM with alerting for sensitive API calls
+  - Scan all container images in CI/CD with Trivy — block critical CVEs from reaching production
+  - Conduct cluster penetration test using kube-bench, kube-hunter, and Peirates
+  - Review cloud IAM for the cluster's node group — apply IRSA/Workload Identity instead of node-level IAM roles
+
+metrics:
+  avg_resolution_time: 90m
+  false_positive_rate: 12%
+  escalation_rate: 55%

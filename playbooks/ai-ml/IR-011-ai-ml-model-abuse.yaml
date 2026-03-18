@@ -1,0 +1,272 @@
+id: IR-011
+name: AI/ML Model Abuse and Training Data Poisoning
+version: 1.0.0
+author: CostNimbus
+category: cloud
+severity: [medium, high, critical]
+mitre_attack:
+  - T1190       # Exploit Public-Facing Application (model API endpoint)
+  - T1078       # Valid Accounts (stolen API keys)
+  - T1496       # Resource Hijacking (excessive inference compute)
+  - T1485       # Data Destruction (training data poisoning)
+  - T1565.001   # Stored Data Manipulation
+  - T1552.001   # Credentials In Files (exposed API keys)
+  - T1059       # Command and Scripting Interpreter (prompt injection)
+trigger:
+  - ml_api_rate_limit_breach
+  - inference_cost_spike_alert
+  - model_endpoint_anomaly
+  - training_pipeline_unauthorized_access
+  - siem_ml_api_abuse
+  - dlp_training_data_exfiltration
+tags:
+  - ai
+  - ml
+  - llm
+  - prompt-injection
+  - model-abuse
+  - training-data-poisoning
+  - api-key-theft
+  - inference-hijacking
+tools_required:
+  - siem
+  - cloud_console
+  - api_gateway
+  - dlp_platform
+  - ml_platform_logs
+  - threat_intelligence_platform
+estimated_time: 60m
+
+integrations:
+  - platform: openai_api
+    optional: true
+    notes: "Usage dashboard and API key management for OpenAI-hosted models"
+  - platform: aws_sagemaker
+    optional: true
+    notes: "CloudWatch metrics for SageMaker endpoints — inference anomaly detection"
+  - platform: azure_ml
+    optional: true
+    notes: "Azure Monitor for ML workspace activity and model registry changes"
+  - platform: splunk
+    optional: true
+    notes: "Ingest model API logs for SIEM correlation and anomaly queries"
+  - platform: datadog
+    optional: true
+    notes: "APM for model serving infrastructure and cost anomaly detection"
+
+steps:
+  - id: step-1
+    name: Identify the abused model endpoint or API key
+    type: investigation
+    tool: api_gateway
+    description: >
+      Identify which model endpoint, API key, or service account is at the center of the
+      anomaly. Review the triggering alert for details: API key ID, model name, endpoint URL,
+      and the nature of the abuse (rate limit breach, unusual request payloads, cost spike).
+      Determine whether the caller is an internal service, external application, or unknown
+      third party. Check if the key is associated with a human developer or a machine identity
+      (CI/CD pipeline, service account).
+    automation_hint: >
+      OpenAI: GET https://api.openai.com/v1/usage — filter by date and API key.
+      AWS SageMaker: aws cloudwatch get-metric-statistics --namespace AWS/SageMaker
+      --metric-name InvocationsPerInstance --dimensions Name=EndpointName,Value=<endpoint>
+      GCP Vertex AI: gcloud logging read 'resource.type="aiplatform.googleapis.com/Endpoint"'
+    outputs:
+      - abused_api_key_id
+      - model_endpoint_name
+      - calling_principal
+      - abuse_type
+
+  - id: step-2
+    name: Assess inference cost and volume anomaly
+    type: investigation
+    tool: cloud_console
+    description: >
+      Quantify the scope of abuse: total API calls in the anomaly window, tokens processed
+      (for LLMs), compute hours consumed, and associated cost impact. Compare against
+      historical baselines for the same key or endpoint. Identify peak usage windows and
+      correlate with business hours to flag off-hours activity. For LLM endpoints, review
+      average prompt and completion lengths for signs of data exfiltration via model outputs.
+    automation_hint: >
+      OpenAI: GET https://api.openai.com/v1/usage?date=YYYY-MM-DD — sum total_tokens by model.
+      AWS Cost Explorer: aws ce get-cost-and-usage --time-period Start=<date>,End=<date>
+      --granularity HOURLY --filter '{"Dimensions":{"Key":"SERVICE","Values":["Amazon SageMaker"]}}'
+      Azure: az consumption usage list --start-date <date> --end-date <date> --query "[?contains(instanceName,'ml')]"
+    outputs:
+      - total_api_calls
+      - total_tokens_or_compute
+      - cost_impact_usd
+      - peak_usage_window
+
+  - id: step-3
+    name: Detect prompt injection or jailbreak attempts
+    type: investigation
+    tool: siem
+    description: >
+      For LLM-based endpoints, review request payloads for prompt injection patterns:
+      instructions to ignore system prompts, role-play overrides, attempts to extract
+      training data or system configuration, DAN (Do Anything Now) patterns, and indirect
+      injection via user-supplied documents. Check if any completions contain sensitive
+      system information, internal data, or PII. Correlate with DLP alerts for data
+      exfiltration via model outputs.
+    automation_hint: >
+      SIEM query (Splunk): index=ml_api_logs
+      | where match(request_body, "(?i)(ignore previous|you are now|disregard|system prompt|reveal your|DAN|jailbreak)")
+      | stats count by src_ip, api_key, model
+      Regex patterns: /ignore (previous|all) (instructions|prompts)/i, /you are (now|a) /i
+      Check completions for SSN, credentials, internal IP patterns.
+    outputs:
+      - prompt_injection_attempts
+      - jailbreak_patterns_found
+      - sensitive_data_in_outputs
+
+  - id: step-4
+    name: Investigate training data pipeline for poisoning or exfiltration
+    type: investigation
+    tool: ml_platform_logs
+    description: >
+      If training pipelines are involved, audit access to training data stores: S3 buckets,
+      GCS buckets, Azure Blob, or on-premises datasets. Look for unauthorized GetObject or
+      ListBucket calls, unexpected data download volumes, or modifications to training datasets
+      (poisoning). Check the model registry for unauthorized model version uploads, which
+      could introduce backdoored model weights. Review feature store access logs.
+    automation_hint: >
+      AWS S3 training data: aws cloudtrail lookup-events --lookup-attributes
+      AttributeKey=EventName,AttributeValue=GetObject --query 'Events[?contains(Resources[].ResourceName, `training`)]'
+      Model registry: aws sagemaker list-model-packages --sort-by CreationTime --sort-order Descending
+      GCS: gcloud logging read 'resource.type="gcs_bucket" AND protoPayload.methodName="storage.objects.get"'
+    outputs:
+      - training_data_access_anomalies
+      - poisoned_datasets
+      - unauthorized_model_versions
+
+  - id: step-5
+    name: Revoke compromised API keys and model endpoint access
+    type: action
+    tool: api_gateway
+    description: >
+      Immediately revoke any compromised or abused API keys. For hosted model APIs (OpenAI,
+      Anthropic, Cohere), rotate the key via the provider's dashboard or API. For self-hosted
+      endpoints (SageMaker, Vertex AI), delete and recreate the endpoint auth token or IAM role.
+      If a service account is involved, disable it and create a new one with least-privilege
+      permissions. Do not delete old keys immediately — preserve for forensics.
+    automation_hint: >
+      OpenAI: DELETE https://api.openai.com/v1/api-keys/<key_id> (dashboard or API)
+      AWS SageMaker: aws iam update-access-key --access-key-id <key> --status Inactive
+      GCP: gcloud iam service-accounts keys disable <key_id> --iam-account=<sa>@<project>.iam.gserviceaccount.com
+      Azure: az ad app credential delete --id <app_id> --key-id <key_id>
+    outputs:
+      - keys_revoked
+      - endpoints_secured
+      - containment_timestamp
+
+  - id: step-6
+    name: Isolate and quarantine affected training environment
+    type: action
+    tool: cloud_console
+    description: >
+      If training data poisoning is suspected, immediately halt all training jobs using the
+      affected datasets. Quarantine the dataset by removing read permissions for all principals
+      except the security team. Snapshot current model weights and training artifacts before
+      any cleanup. Pause the model registry to prevent deployment of potentially poisoned models.
+      Cordon off the training VPC/VNet if lateral movement is suspected.
+    automation_hint: >
+      AWS: aws sagemaker stop-training-job --training-job-name <job>
+      Quarantine S3: aws s3api put-bucket-policy --bucket <bucket> --policy '{"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":"arn:aws:s3:::<bucket>/*","Condition":{"StringNotEquals":{"aws:PrincipalArn":"arn:aws:iam::<account>:role/SecurityTeam"}}}]}'
+      GCP: gcloud ml-engine jobs cancel <job_id>
+    outputs:
+      - training_jobs_stopped
+      - datasets_quarantined
+      - model_registry_paused
+
+  - id: step-7
+    name: Assess model integrity and rollback if poisoned
+    type: action
+    tool: ml_platform_logs
+    description: >
+      For models suspected of training data poisoning or backdoor injection, perform integrity
+      checks: compare current model hash against the last known-good checkpoint, run model
+      evaluation on a clean holdout dataset to detect behavioral anomalies, and check for
+      unusual activation patterns or backdoor triggers. If poisoning is confirmed, roll back
+      to the last clean model version from the model registry and retrain from verified data.
+    automation_hint: >
+      Compare model artifacts: sha256sum model.tar.gz vs stored baseline hash
+      AWS SageMaker: aws sagemaker describe-model --model-name <model> | jq '.PrimaryContainer.ModelDataUrl'
+      Azure ML: az ml model list --workspace-name <ws> --resource-group <rg> --query '[].{name:name,version:version}'
+      Rollback: aws sagemaker create-model --primary-container ImageUri=<uri>,ModelDataUrl=<clean_s3_path>
+    outputs:
+      - model_integrity_status
+      - rollback_completed
+      - clean_model_version
+
+  - id: step-8
+    name: Implement API gateway rate limiting and geo-restrictions
+    type: action
+    tool: api_gateway
+    description: >
+      Harden the model endpoint access controls: implement strict per-key rate limiting,
+      add geographic IP restrictions for model API endpoints, enable request payload validation
+      to block known injection patterns, require mutual TLS for internal service-to-model
+      communication, and implement usage quotas with automatic alerts for anomalous spend.
+      Consider adding a WAF rule set for LLM-specific attack patterns.
+    automation_hint: >
+      AWS API Gateway: aws apigateway create-usage-plan --name MLRateLimit --throttle burstLimit=100,rateLimit=50
+      AWS WAF: aws wafv2 create-rule-group — add prompt injection regex match rules
+      GCP Apigee: gcloud apigee apis deploy -- add quota policies
+      Azure APIM: az apim product api add — configure rate limits and IP filtering
+    outputs:
+      - rate_limiting_applied
+      - geo_restrictions_set
+      - waf_rules_deployed
+
+  - id: step-9
+    name: Notify affected teams and document findings
+    type: notification
+    description: >
+      Notify the ML engineering team, data science leads, and security leadership of the
+      incident scope, impacted models, data exposure risk, and remediation status. If customer
+      data was submitted to or returned from the model in violation of data governance policies,
+      initiate the data breach notification workflow. Document all findings, timeline, and
+      remediation actions in the incident management system.
+    automation_hint: >
+      Slack: POST /api/chat.postMessage to #ml-security-incidents with incident summary
+      PagerDuty: pd incident create --title "IR-011 AI/ML Abuse" --urgency high
+      JIRA: Create Security incident ticket with parent Epic link
+    outputs:
+      - notifications_sent
+      - incident_ticket_created
+
+  - id: step-10
+    name: Determine initial access vector and close exposure
+    type: investigation
+    description: >
+      Trace how the attacker obtained the API key or model endpoint access. Common vectors:
+      hardcoded key in public GitHub repository, exposed in CI/CD environment variables, leaked
+      via SSRF targeting the cloud metadata service, insider threat, or supply chain compromise.
+      Use git history scanning, CI/CD pipeline audit, and secrets scanning tools to find the
+      source. Revoke and rotate all keys that may have been co-exposed.
+    automation_hint: >
+      GitGuardian / trufflehog: trufflehog git https://github.com/<org>/<repo> --only-verified
+      GitHub secret scanning: gh secret list --repo <org>/<repo>
+      AWS: git log -p | grep -E "(OPENAI|sk-|ANTHROPIC_API_KEY|Bearer)" (check CI configs)
+      Secrets manager audit: aws secretsmanager list-secrets | jq '.SecretList[].Tags'
+    outputs:
+      - initial_access_vector
+      - exposure_source_closed
+      - additional_keys_rotated
+
+post_incident:
+  - Implement secrets scanning (GitGuardian, trufflehog) as mandatory pre-commit and CI gate
+  - Enforce API key rotation policy — maximum 90-day key lifetime for all AI/ML platform keys
+  - Deploy prompt injection detection layer (e.g., Rebuff, LLM Guard) in front of all LLM endpoints
+  - Audit model registry access controls — enforce code review and security approval for model promotions
+  - Implement ML model signing and hash verification to detect tampering of model artifacts
+  - Enable spend anomaly alerts on all AI/ML API accounts with automatic key suspension thresholds
+  - Review data governance policies for training datasets — classify sensitivity and enforce access controls
+  - Conduct red team exercise targeting AI/ML infrastructure to identify additional attack surfaces
+  - Add AI/ML abuse detection rules to SIEM with automated SOAR response playbook
+
+metrics:
+  avg_resolution_time: 90m
+  false_positive_rate: 15%
+  escalation_rate: 45%
